@@ -477,12 +477,12 @@ class Operation(BaseOperation):
 
     def _ask_ai_suitability(
         self, prompt: str, vacancy_name: str, log_suffix: str = ""
-    ) -> bool:
+    ) -> tuple[bool, str]:
 
         MAX_RETRIES = 3
 
         if not self.vacancy_filter_ai:
-            return True
+            return True, ""
 
         for attempt in range(MAX_RETRIES):
             try:
@@ -498,12 +498,22 @@ class Operation(BaseOperation):
 
                 result = self._parse_ai_json_response(response)
                 if result is not None:
-                    if result:
-                        return True
+                    suitable, reason = result
+                    if suitable:
+                        logger.info(
+                            "Вакансия %s подтверждена AI %s: %s",
+                            vacancy_name,
+                            log_suffix,
+                            reason or "-",
+                        )
+                        return True, reason
                     logger.info(
-                        "Вакансия %s отклонена AI %s", vacancy_name, log_suffix
+                        "Вакансия %s отклонена AI %s: %s",
+                        vacancy_name,
+                        log_suffix,
+                        reason or "-",
                     )
-                    return False
+                    return False, reason
 
                 # Если не удалось распарсить JSON, повторяем запрос
                 logger.warning(
@@ -518,7 +528,7 @@ class Operation(BaseOperation):
             except AIError as e:
                 # ChatOpenAI уже делает retry для 429, поэтому здесь только логируем
                 logger.error("Ошибка AI %s: %s", log_suffix, e)
-                return True
+                return True, ""
 
         logger.warning(
             "AI %s не дал валидный JSON после %d попыток для вакансии %s",
@@ -526,15 +536,17 @@ class Operation(BaseOperation):
             MAX_RETRIES,
             vacancy_name,
         )
-        return True
+        return True, "не удалось распознать ответ AI"
 
-    def _parse_ai_json_response(self, response: str) -> bool | None:
+    def _parse_ai_json_response(
+        self, response: str
+    ) -> tuple[bool, str] | None:
         response = response.strip().lower()
 
         if response in ("да", "yes", "true"):
-            return True
+            return True, ""
         if response in ("нет", "no", "false"):
-            return False
+            return False, ""
 
         import re
 
@@ -552,14 +564,17 @@ class Operation(BaseOperation):
         if json_match:
             try:
                 data = utils_json.loads(json_match.group(0))
-                return data.get("suitable")
+                suitable = data.get("suitable")
+                if suitable is None:
+                    return None
+                return bool(suitable), str(data.get("reason") or "")
             except Exception:
                 pass
 
         return None
 
     # КТО ЭТО ПРОЧИТАЛ ТОТ ПИД@РАС
-    def _is_vacancy_suitable_heavy(self, vacancy: dict) -> bool:
+    def _is_vacancy_suitable_heavy(self, vacancy: dict) -> tuple[bool, str]:
         full_vacancy = None
         if vacancy.get("id"):
             full_vacancy = self.api_client.get(f"/vacancies/{vacancy['id']}")
@@ -574,7 +589,7 @@ class Operation(BaseOperation):
             prompt, vacancy.get("name", ""), "(heavy)"
         )
 
-    def _is_vacancy_suitable_light(self, vacancy: dict) -> bool:
+    def _is_vacancy_suitable_light(self, vacancy: dict) -> tuple[bool, str]:
         vacancy_info = self._build_vacancy_context(vacancy, include_full=False)
         prompt = f"Вакансия: {vacancy_info}"
         return self._ask_ai_suitability(
@@ -601,9 +616,8 @@ class Operation(BaseOperation):
 4. Если данных мало:
    - ориентируйся на название роли
 
-Не пиши объяснения.
-Ответ строго JSON:
-{{"suitable": true}} или {{"suitable": false}}
+Ответ строго JSON, reason — краткая причина (2-3 слова, по-русски):
+{{"suitable": true, "reason": "..."}} или {{"suitable": false, "reason": "..."}}
 
 Кандидат:
 {resume_analysis}
@@ -627,8 +641,8 @@ class Operation(BaseOperation):
 - если роли явно разные или совпадений по навыкам почти нет -> suitable = false
 - если данных мало -> ориентируйся только на явные совпадения, без фантазий
 
-Ответ только JSON:
-{{"suitable": true}} или {{"suitable": false}}
+Ответ только JSON, reason — краткая причина (2-3 слова, по-русски):
+{{"suitable": true, "reason": "..."}} или {{"suitable": false, "reason": "..."}}
 
 Кандидат:
 {resume_analysis}
@@ -871,13 +885,14 @@ class Operation(BaseOperation):
                         vacancy, "excluded_filter", resume["id"]
                     )
 
-                    self.api_client.put(
-                        f"/vacancies/blacklisted/{vacancy['id']}"
-                    )
-                    logger.info(
-                        "Вакансия добавлена в черный список: %s",
-                        vacancy["alternate_url"],
-                    )
+                    if not self.dry_run:
+                        self.api_client.put(
+                            f"/vacancies/blacklisted/{vacancy['id']}"
+                        )
+                        logger.info(
+                            "Вакансия добавлена в черный список: %s",
+                            vacancy["alternate_url"],
+                        )
                     continue
 
                 # AI фильтрация вакансий
@@ -894,9 +909,13 @@ class Operation(BaseOperation):
                         continue
 
                     if self.ai_filter == "heavy":
-                        is_suitable = self._is_vacancy_suitable_heavy(vacancy)
+                        is_suitable, ai_reason = (
+                            self._is_vacancy_suitable_heavy(vacancy)
+                        )
                     elif self.ai_filter == "light":
-                        is_suitable = self._is_vacancy_suitable_light(vacancy)
+                        is_suitable, ai_reason = (
+                            self._is_vacancy_suitable_light(vacancy)
+                        )
                     else:
                         raise ValueError(
                             f"Неизвестный режим AI фильтра: {self.ai_filter}"
@@ -904,12 +923,14 @@ class Operation(BaseOperation):
 
                     if not is_suitable:
                         logger.info(
-                            "Вакансия отклонена AI фильтром (%s): %s",
+                            "Вакансия отклонена AI фильтром (%s): %s — %s",
                             self.ai_filter,
                             vacancy["alternate_url"],
+                            ai_reason or "-",
                         )
                         print(
-                            f"🧠 AI ({self.ai_filter}) посчитал неподходящей",
+                            f"🧠 AI ({self.ai_filter}) посчитал неподходящей"
+                            f" ({ai_reason or '-'})",
                             vacancy["alternate_url"],
                         )
 
@@ -976,7 +997,7 @@ class Operation(BaseOperation):
                 if self.force_message or vacancy.get(
                     "response_letter_required"
                 ):
-                    if self.cover_letter_ai:
+                    if self.cover_letter_ai and not self.args.letter_file:
                         msg = self.message_prompt + "\n\n"
                         msg += (
                             "Название вакансии: "
@@ -1007,33 +1028,37 @@ class Operation(BaseOperation):
                     )
 
                     try:
-                        if not self.dry_run:
-                            result = self._solve_vacancy_test(
-                                vacancy_id=vacancy["id"],
-                                resume_hash=resume["id"],
-                                letter=letter,
+                        result = self._solve_vacancy_test(
+                            vacancy_id=vacancy["id"],
+                            resume_hash=resume["id"],
+                            letter=letter,
+                        )
+                        if self.dry_run:
+                            print(
+                                "🧪 [dry-run] тест решён, отклик не отправлен",
+                                vacancy["alternate_url"],
                             )
-                            if result.get("success") == "true":
-                                applied_count += 1
-                                print(
-                                    "📨 Отправили отклик на вакансию с тестом",
-                                    vacancy["alternate_url"],
-                                )
-                            else:
-                                err = result.get("error")
+                        elif result.get("success") == "true":
+                            applied_count += 1
+                            print(
+                                "📨 Отправили отклик на вакансию с тестом",
+                                vacancy["alternate_url"],
+                            )
+                        else:
+                            err = result.get("error")
 
-                                if err == "negotiations-limit-exceeded":
-                                    do_apply = False
-                                    limit_reached = True
-                                    logger.warning(
-                                        "Достигли лимита на отклики (отправлено в этой сессии: %d)",
-                                        applied_count,
-                                    )
-                                    break
-                                else:
-                                    logger.error(
-                                        f"Произошла ошибка при отклике на вакансию с тестом: {vacancy['alternate_url']} - {err}"
-                                    )
+                            if err == "negotiations-limit-exceeded":
+                                do_apply = False
+                                limit_reached = True
+                                logger.warning(
+                                    "Достигли лимита на отклики (отправлено в этой сессии: %d)",
+                                    applied_count,
+                                )
+                                break
+                            else:
+                                logger.error(
+                                    f"Произошла ошибка при отклике на вакансию с тестом: {vacancy['alternate_url']} - {err}"
+                                )
                     except Exception as ex:
                         logger.error(f"Произошла непредвиденная ошибка: {ex}")
                         continue
@@ -1055,6 +1080,11 @@ class Operation(BaseOperation):
                             applied_count += 1
                             print(
                                 "📨 Отправили отклик на вакансию",
+                                vacancy["alternate_url"],
+                            )
+                        else:
+                            print(
+                                "🧪 [dry-run] отклик не отправлен",
                                 vacancy["alternate_url"],
                             )
                     except Redirect:
@@ -1079,6 +1109,11 @@ class Operation(BaseOperation):
                                     applied_count += 1
                                     print(
                                         "📨 Отправили отклик на вакансию после капчи",
+                                        vacancy["alternate_url"],
+                                    )
+                                else:
+                                    print(
+                                        "🧪 [dry-run] отклик после капчи не отправлен",
                                         vacancy["alternate_url"],
                                     )
                             else:
@@ -1157,14 +1192,15 @@ class Operation(BaseOperation):
     def _get_vacancy_tests(self, response_url: str) -> VacancyTestsData:
         """Парсит тесты"""
         r = self.tool.session.get(response_url)
+        text = html.unescape(r.text)
         tests_marker = ',"vacancyTests":'
 
-        if -1 == (tests_start_pos := r.text.find(tests_marker)):
+        if -1 == (tests_start_pos := text.find(tests_marker)):
             raise ValueError("tests not found.")
 
         try:
             res, _ = self.json_decoder.raw_decode(
-                r.text, tests_start_pos + len(tests_marker)
+                text, tests_start_pos + len(tests_marker)
             )
             return res
         except json.JSONDecodeError as ex:
@@ -1231,6 +1267,20 @@ class Operation(BaseOperation):
                         match.group(0) if match else solutions[0]["id"]
                     )
                     payload[field_name] = selected_id
+                    selected_text = next(
+                        (
+                            strip_tags(s["text"])
+                            for s in solutions
+                            if str(s["id"]) == str(selected_id)
+                        ),
+                        ai_answer,
+                    )
+                    logger.info(
+                        "Тест %s — вопрос: %r → AI выбрал: %r",
+                        vacancy_id,
+                        question,
+                        selected_text,
+                    )
                 else:
                     yes_solution = next(
                         filter(lambda x: x["text"].lower() == "да", solutions),
@@ -1258,6 +1308,12 @@ class Operation(BaseOperation):
                 elif self.cover_letter_ai:
                     prompt = f"Дай краткий и профессиональный ответ на вопрос: {question}"
                     answer = self.cover_letter_ai.complete(prompt)
+                    logger.info(
+                        "Тест %s — вопрос: %r → AI ответил: %r",
+                        vacancy_id,
+                        question,
+                        answer,
+                    )
                 # Тупоеблые любят вопросы с ответами да/нет, где ответ да является правильным в большинстве случаев.
                 else:
                     answer = "Да"
@@ -1265,6 +1321,9 @@ class Operation(BaseOperation):
                 payload[f"{field_name}_text"] = answer
 
         logger.debug(f"{payload = }")
+
+        if self.dry_run:
+            return {"success": "dry_run"}
 
         # Ожидание перед отправкой (float)
         time.sleep(random.uniform(2.0, 3.0))
@@ -1463,7 +1522,10 @@ class Operation(BaseOperation):
             )
         )
 
-        logger.debug(vacancy_summary)
+        logger.debug(
+            "Проверяем вакансию на excluded_filter: %s",
+            vacancy.get("alternate_url", vacancy.get("id")),
+        )
 
         excluded_pat: re.Pattern = re.compile(
             self.excluded_filter, re.IGNORECASE
@@ -1480,7 +1542,6 @@ class Operation(BaseOperation):
             re.search(r'"description": (.*)', r.text).group(1)
         )
         description = strip_tags(description)
-        logger.debug(description[:2047])
         return bool(excluded_pat.search(description))
 
     def _is_vacancy_already_skipped(
