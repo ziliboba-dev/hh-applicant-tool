@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import html
-import json
 import logging
 import random
 import re
@@ -24,10 +23,12 @@ from ..api.errors import ApiError, CaptchaRequired, LimitExceeded
 from ..main import BaseNamespace, BaseOperation
 from ..storage.repositories.errors import RepositoryError
 from ..utils.datatypes import VacancyTestsData
+from ..utils.find import find_key
 from ..utils.json import JSONDecoder
 from ..utils.string import (
     bool2str,
     rand_text,
+    shorten,
     strip_tags,
     unescape_string,
 )
@@ -45,13 +46,15 @@ class Namespace(BaseNamespace):
     ignore_employers: Path | None
     force_message: bool
     use_ai: bool
-    ai_filter: Literal["heavy", "light"] | None
+    ai_filter: Literal["heavy", "light", "custom"] | None
     ai_rate_limit: int
+    ai_filter_prompt: str | None
     system_prompt: str
     message_prompt: str
     order_by: str
     search: str
     schedule: str
+    work_format: list[str] | None
     dry_run: bool
     # Пошли доп фильтры, которых не было
     experience: str
@@ -119,8 +122,8 @@ class Operation(BaseOperation):
         )
         parser.add_argument(
             "--ai-filter",
-            help="Использовать AI для фильтрации вакансий. Режимы: heavy - полный анализ вакансии и резюме, light - быстрый анализ по названию и навыкам",
-            choices=["heavy", "light"],
+            help="Использовать AI для фильтрации вакансий. Режимы: heavy - полный анализ вакансии и резюме, light - быстрый анализ по названию и навыкам, custom - свой системный промпт (--ai-filter-prompt)",
+            choices=["heavy", "light", "custom"],
             default=None,
         )
         parser.add_argument(
@@ -128,6 +131,11 @@ class Operation(BaseOperation):
             help="Лимит запросов к AI в минуту для фильтрации",
             type=int,
             default=40,
+        )
+        parser.add_argument(
+            "--ai-filter-prompt",
+            help="Системный промпт для AI-фильтра (используется только в режиме custom)",
+            default=None,
         )
         parser.add_argument(
             "--system-prompt",
@@ -172,7 +180,7 @@ class Operation(BaseOperation):
         parser.add_argument(
             "--max-responses",
             type=int,
-            help="Пропускать отклик на вакансии с более чем N откликов (не реализован)",
+            help="Отправить не более N откликов (по умолчанию без ограничения)",
         )
         parser.add_argument(
             "--dry-run",
@@ -209,6 +217,11 @@ class Operation(BaseOperation):
             "--schedule",
             help="Тип графика (fullDay, shift, flexible, remote, flyInFlyOut)",
             type=str,
+        )
+        api_search_filters.add_argument(
+            "--work-format",
+            nargs="+",
+            help="Формат работы (REMOTE, HYBRID, ON_SITE, FIELD_WORK)",
         )
         api_search_filters.add_argument(
             "--employment", nargs="+", help="Тип занятости"
@@ -344,6 +357,7 @@ class Operation(BaseOperation):
         self.right_lng = args.right_lng
         self.salary = args.salary
         self.schedule = args.schedule
+        self.work_format = args.work_format
         self.search = args.search
         self.search_field = args.search_field
         self.sort_point_lat = args.sort_point_lat
@@ -356,6 +370,7 @@ class Operation(BaseOperation):
             else None
         )
         self.ai_filter = args.ai_filter
+        self.ai_filter_prompt = args.ai_filter_prompt
         self.vacancy_filter_ai = None
         self._resume_analysis_cache: dict[tuple[str | None, str], str] = {}
 
@@ -574,7 +589,9 @@ class Operation(BaseOperation):
         return None
 
     # КТО ЭТО ПРОЧИТАЛ ТОТ ПИД@РАС
-    def _is_vacancy_suitable_heavy(self, vacancy: dict) -> tuple[bool, str]:
+    def _is_vacancy_suitable_heavy(
+        self, vacancy: dict, log_suffix: str = "(heavy)"
+    ) -> tuple[bool, str]:
         full_vacancy = None
         if vacancy.get("id"):
             full_vacancy = self.api_client.get(f"/vacancies/{vacancy['id']}")
@@ -586,7 +603,7 @@ class Operation(BaseOperation):
         )
         prompt = f"Вакансия: {vacancy_info}"
         return self._ask_ai_suitability(
-            prompt, vacancy.get("name", ""), "(heavy)"
+            prompt, vacancy.get("name", ""), log_suffix
         )
 
     def _is_vacancy_suitable_light(self, vacancy: dict) -> tuple[bool, str]:
@@ -775,22 +792,41 @@ class Operation(BaseOperation):
         site_emails = {}
 
         if self.ai_filter:
-            if self.ai_filter == "heavy":
-                system_prompt = self._build_filter_system_prompt_heavy(
-                    self._analyze_resume_heavy(resume)
-                )
+            if self.ai_filter in ("heavy", "custom"):
+                resume_analysis = self._analyze_resume_heavy(resume)
             elif self.ai_filter == "light":
-                system_prompt = self._build_filter_system_prompt_light(
-                    self._analyze_resume_light(resume)
-                )
+                resume_analysis = self._analyze_resume_light(resume)
             else:
                 raise ValueError(
                     f"Неизвестный режим AI фильтра: {self.ai_filter}"
                 )
 
+            if self.ai_filter == "custom":
+                if not self.ai_filter_prompt:
+                    raise ValueError(
+                        "Режим 'custom' требует --ai-filter-prompt"
+                    )
+                # Кастомный промпт заменяет только инструкции. Анализ резюме
+                # добавляем блоком "Кандидат" в конец (как во встроенных).
+                system_prompt = (
+                    f"{self.ai_filter_prompt}\n\nКандидат:\n{resume_analysis}\n\n"
+                    "Не пиши объяснения.\n"
+                    'Ответ строго JSON:\n'
+                    '{{"suitable": true}} или {{"suitable": false}}'
+                )
+            elif self.ai_filter == "heavy":
+                system_prompt = self._build_filter_system_prompt_heavy(
+                    resume_analysis
+                )
+            else:
+                system_prompt = self._build_filter_system_prompt_light(
+                    resume_analysis
+                )
+
             logger.debug(
-                "AI системный промпт (%s): %s",
+                "AI системный промпт (%s, custom=%s): %s",
                 self.ai_filter,
+                bool(self.ai_filter_prompt),
                 system_prompt,
             )
 
@@ -807,6 +843,12 @@ class Operation(BaseOperation):
                 and self._cancel_event.is_set()
             ):
                 logger.info("Операция отменена пользователем")
+                break
+            if self.max_responses and applied_count >= self.max_responses:
+                logger.info(
+                    "Достигнут лимит откликов --max-responses (%d). Останавливаюсь.",
+                    self.max_responses,
+                )
                 break
             try:
                 employer = vacancy.get("employer", {})
@@ -908,9 +950,10 @@ class Operation(BaseOperation):
                         )
                         continue
 
-                    if self.ai_filter == "heavy":
-                        is_suitable, ai_reason = (
-                            self._is_vacancy_suitable_heavy(vacancy)
+                    if self.ai_filter in ("heavy", "custom"):
+                        is_suitable, ai_reason = self._is_vacancy_suitable_heavy(
+                            vacancy,
+                            "(custom)" if self.ai_filter == "custom" else "(heavy)",
                         )
                     elif self.ai_filter == "light":
                         is_suitable, ai_reason = (
@@ -999,15 +1042,32 @@ class Operation(BaseOperation):
                 ):
                     if self.cover_letter_ai and not self.args.letter_file:
                         msg = self.message_prompt + "\n\n"
+                        ## добавляем переменные в контекст AI запроса ##
                         msg += (
-                            "Название вакансии: "
-                            + message_placeholders["vacancy_name"]
+                            "[ВАКАНСИЯ] "
+                            + "Название: "
+                            + message_placeholders["vacancy_name"] + ", "
+                            + "Работодатель: "
+                            + message_placeholders["employer_name"] + "; "
                         )
                         msg += (
-                            "Мое резюме: "
-                            + message_placeholders["resume_title"]
+                            "[РЕЗЮМЕ] "
+                            + "Название: "
+                            + message_placeholders["resume_title"] + ", "
+                            + "Ссылка на резюме: "
+                            + message_placeholders["resume_url"] + ", "    
                         )
-                        logger.debug("prompt: %s", msg)
+                        msg += (
+                            "Имя: "
+                            + message_placeholders["first_name"] + ", "
+                            + "Фамилия: "
+                            + message_placeholders["last_name"] + ", "
+                            + "Телефон: "
+                            + message_placeholders["phone"] + ", "
+                            + "Почта: "
+                            + message_placeholders["email"]
+                        )
+                        ## logger.debug("prompt: %s", msg) ## убираем отладку
                         letter = self.cover_letter_ai.complete(msg)
                     else:
                         letter = (
@@ -1021,6 +1081,8 @@ class Operation(BaseOperation):
                     vacancy["alternate_url"],
                 )
 
+                test_handled = False
+
                 if vacancy.get("has_test"):
                     logger.debug(
                         "Решаем тест: %s",
@@ -1033,6 +1095,7 @@ class Operation(BaseOperation):
                             resume_hash=resume["id"],
                             letter=letter,
                         )
+                        test_handled = True
                         if self.dry_run:
                             print(
                                 "🧪 [dry-run] тест решён, отклик не отправлен",
@@ -1045,7 +1108,11 @@ class Operation(BaseOperation):
                                 vacancy["alternate_url"],
                             )
                         else:
-                            err = result.get("error")
+                            err = (
+                                result.get("error")
+                                if isinstance(result, dict)
+                                else None
+                            )
 
                             if err == "negotiations-limit-exceeded":
                                 do_apply = False
@@ -1056,14 +1123,32 @@ class Operation(BaseOperation):
                                 )
                                 break
                             else:
-                                logger.error(
-                                    f"Произошла ошибка при отклике на вакансию с тестом: {vacancy['alternate_url']} - {err}"
+                                status = (
+                                    result.get("_http_status")
+                                    if isinstance(result, dict)
+                                    else None
                                 )
+                                logger.error(
+                                    "Произошла ошибка при отклике на вакансию с тестом: %s (HTTP %s), result: %s",
+                                    vacancy["alternate_url"],
+                                    status if status is not None else "?",
+                                    shorten(str(result), 300),
+                                )
+                    except ValueError as ex:
+                        if str(ex) == "tests not found.":
+                            logger.warning(
+                                "Не удалось получить тест (%s), пробую откликнуться как на обычную вакансию: %s",
+                                ex,
+                                vacancy["alternate_url"],
+                            )
+                        else:
+                            logger.error(f"Произошла непредвиденная ошибка: {ex}")
+                            continue
                     except Exception as ex:
                         logger.error(f"Произошла непредвиденная ошибка: {ex}")
                         continue
 
-                else:
+                if not test_handled:
                     params = {
                         "resume_id": resume["id"],
                         "vacancy_id": vacancy_id,
@@ -1189,22 +1274,10 @@ class Operation(BaseOperation):
 
     json_decoder = JSONDecoder()
 
-    def _get_vacancy_tests(self, response_url: str) -> VacancyTestsData:
+    def _get_vacancy_tests(self, response_url: str) -> VacancyTestsData | None:
         """Парсит тесты"""
-        r = self.tool.session.get(response_url)
-        text = html.unescape(r.text)
-        tests_marker = ',"vacancyTests":'
-
-        if -1 == (tests_start_pos := text.find(tests_marker)):
-            raise ValueError("tests not found.")
-
-        try:
-            res, _ = self.json_decoder.raw_decode(
-                text, tests_start_pos + len(tests_marker)
-            )
-            return res
-        except json.JSONDecodeError as ex:
-            raise ValueError("Не могу распарсить vacancyTests.") from ex
+        res = self.tool.get_redirect_config(response_url)
+        return find_key(res, "vacancyTests")
 
     def _solve_vacancy_test(
         self,
@@ -1215,14 +1288,12 @@ class Operation(BaseOperation):
         """Загружает тест, ждет паузу и отправляет отклик."""
         response_url = f"https://hh.ru/applicant/vacancy_response?vacancyId={vacancy_id}&startedWithQuestion=false&hhtmFrom=vacancy"
 
-        # Загружаем данные теста и токен
-        tests_data = self._get_vacancy_tests(response_url)
+        if not (tests_data := self._get_vacancy_tests(response_url)):
+            raise ValueError(f"Данные тестов не найдены на {response_url}.")
 
-        try:
-            test_data = tests_data[str(vacancy_id)]
-        except KeyError as ex:
-            raise ValueError("Отсутствуют данные теста для вакансии.") from ex
-
+        if not (test_data := tests_data.get(str(vacancy_id))):
+            raise ValueError(f"Пустые данные теста вакансии vacancy_id={vacancy_id}")
+        
         logger.debug(f"{test_data = }")
 
         payload: dict[str, Any] = {
@@ -1349,8 +1420,22 @@ class Operation(BaseOperation):
             response.status_code,
         )
 
-        data = response.json()
-        # logger.debug(data)
+        try:
+            data = response.json()
+        except (ValueError, requests.exceptions.JSONDecodeError) as ex:
+            logger.warning(
+                "Ответ на отклик с тестом не является JSON (status=%s, %s), result: %s",
+                response.status_code,
+                response.url,
+                shorten(response.text, 300),
+            )
+            raise ValueError(
+                "Эндпоинт отклика на тест вернул не-JSON ответ "
+                "(возможно, перенаправление на капчу или форму)."
+            ) from ex
+
+        if isinstance(data, dict):
+            data["_http_status"] = response.status_code
 
         return data
 
@@ -1423,6 +1508,8 @@ class Operation(BaseOperation):
             params["text"] = self.search
         if self.schedule:
             params["schedule"] = self.schedule
+        if self.work_format:
+            params["work_format"] = list(self.work_format)
         if self.experience:
             params["experience"] = self.experience
         if self.currency:
@@ -1538,9 +1625,18 @@ class Operation(BaseOperation):
         r = self.tool.session.get("https://hh.ru/vacancy/" + vacancy["id"])
         r.raise_for_status()
 
-        description, _ = self.json_decoder.raw_decode(
-            re.search(r'"description": (.*)', r.text).group(1)
-        )
+        # На странице вакансии поле description иногда встречается в двух
+        # вариантах верстки: `"description": "..."` и `"description":"..."`
+        # (без пробела после двоеточия) — учитываем оба.
+        description_match = re.search(r'"description":\s*(.*)', r.text)
+        if not description_match:
+            logger.warning(
+                "Не удалось найти описание вакансии на странице: %s",
+                vacancy["alternate_url"],
+            )
+            return False
+
+        description, _ = self.json_decoder.raw_decode(description_match.group(1))
         description = strip_tags(description)
         return bool(excluded_pat.search(description))
 
