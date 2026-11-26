@@ -1,67 +1,35 @@
 from __future__ import annotations
 
 import argparse
-import json
-import logging
 import os
 import platform
 import subprocess
-from typing import TYPE_CHECKING, Any
+from pathlib import Path
+from typing import TYPE_CHECKING
 
-from ..main import BaseNamespace, BaseOperation
+from ..tool import BaseNamespace, BaseOperation
+from ..utils import logger
 
 if TYPE_CHECKING:
-    from ..main import HHApplicantTool
-
-
-logger = logging.getLogger(__package__)
+    from ..tool import HHApplicantTool
 
 
 class Namespace(BaseNamespace):
-    show_path: bool
-    key: str
-    set: list[str]
+    key: str | None
+    value: str | None
     edit: bool
-    unset: str
+    delete: str | None
+    show_path: bool
 
 
-def get_value(data: dict[str, Any], path: str) -> Any:
-    for key in path.split("."):
-        if isinstance(data, dict):
-            data = data.get(key)
-        else:
+def parse_scalar(value: str) -> bool | int | float | str | None:
+    match value.lower():
+        case "null" | "none" | "nil":
             return None
-    return data
-
-
-def set_value(data: dict[str, Any], path: str, value: Any) -> None:
-    """Устанавливает значение во вложенном словаре по ключу в виде строки."""
-    keys = path.split(".")
-    for key in keys[:-1]:
-        data = data.setdefault(key, {})
-    data[keys[-1]] = value
-
-
-def del_value(data: dict[str, Any], path: str) -> None:
-    """Удаляет значение из вложенного словаря по ключу в виде строки."""
-    keys = path.split(".")
-    for key in keys[:-1]:
-        if not isinstance(data, dict) or key not in data:
+        case "true":
+            return True
+        case "false":
             return False
-        data = data[key]
-
-    try:
-        del data[keys[-1]]
-        return True
-    except KeyError:
-        return False
-
-
-def parse_scalar(value: str) -> bool | int | float | str:
-    if value == "null":
-        return None
-    if value in ["true", "false"]:
-        return "t" in value
     try:
         return float(value) if "." in value else int(value)
     except ValueError:
@@ -72,9 +40,24 @@ class Operation(BaseOperation):
     """
     Операции с конфигурационным файлом.
     По умолчанию выводит содержимое конфига.
+
+    config openai.defaul.model          вывести значение
+    config openai.default.model gpt-4o  установить значение
+    config -d openai.model              удалить ключ
     """
 
     def setup_parser(self, parser: argparse.ArgumentParser) -> None:
+        self.parser = parser
+        parser.add_argument(
+            "key",
+            nargs="?",
+            help="Ключ конфига, например openai.model",
+        )
+        parser.add_argument(
+            "value",
+            nargs="?",
+            help="Новое значение (если не указано, значение ключа выводится)",
+        )
         group = parser.add_mutually_exclusive_group()
         group.add_argument(
             "-e",
@@ -83,17 +66,11 @@ class Operation(BaseOperation):
             help="Открыть конфигурационный файл в редакторе",
         )
         group.add_argument(
-            "-k", "--key", help="Вывести отдельное значение из конфига"
-        )
-        group.add_argument(
-            "-s",
-            "--set",
-            nargs=2,
-            metavar=("KEY", "VALUE"),
-            help="Установить значение в конфиг, например, --set openai.model gpt-4o",
-        )
-        group.add_argument(
-            "-u", "--unset", metavar="KEY", help="Удалить ключ из конфига"
+            "-d",
+            "--delete",
+            "--unset",
+            metavar="KEY",
+            help="Удалить ключ из конфига",
         )
         group.add_argument(
             "-p",
@@ -105,41 +82,48 @@ class Operation(BaseOperation):
 
     def run(self, applicant_tool: HHApplicantTool, args: Namespace) -> None:
         config = applicant_tool.config
-        if args.set:
-            key, value = args.set
-            set_value(config, key, parse_scalar(value))
-            config.save()
-            logger.info("Значение '%s' для ключа '%s' сохранено.", value, key)
-            return
 
-        if args.unset:
-            key = args.unset
-            if del_value(config, key):
-                config.save()
-                logger.info("Ключ '%s' удален из конфига.", key)
-            else:
-                logger.warning("Ключ '%s' не найден в конфиге.", key)
-            return
+        if args.key and (args.edit or args.delete or args.show_path):
+            logger.error("Ключ нельзя сочетать с -e, -d и -p.")
+            return 1
 
         if args.key:
-            value = get_value(config, args.key)
-            if value is not None:
-                print(value)
+            if args.value is None:
+                value = config.get_value(args.key)
+                if value is not None:
+                    print(value)
+            else:
+                config.set_value(
+                    args.key, parse_scalar(args.value), create=True
+                )
+                config.save()
+                logger.info(
+                    "Значение '%s' для ключа '%s' сохранено.",
+                    args.value,
+                    args.key,
+                )
             return
 
-        config_path = str(config._config_path)
+        if args.delete:
+            if config.delete_value(args.delete, prune=True):
+                config.save()
+                logger.info("Ключ '%s' удален из конфига.", args.delete)
+            else:
+                logger.warning("Ключ '%s' не найден в конфиге.", args.delete)
+            return
+
         if args.show_path:
-            print(config_path)
+            print(config.path)
             return
 
         if args.edit:
-            self._open_editor(config_path)
+            self._open_editor(config.path)
             return
 
-        # Default action: show content
-        print(json.dumps(config, indent=2, ensure_ascii=False))
+        self.parser.print_help()
+        return 2
 
-    def _open_editor(self, filepath: str) -> None:
+    def _open_editor(self, filepath: Path) -> None:
         """Открывает файл в редакторе по умолчанию в зависимости от ОС."""
         match platform.system():
             case "Windows":

@@ -1,27 +1,21 @@
 from __future__ import annotations
 
 import argparse
-import logging
+import json
 import sys
-from collections import defaultdict
 from typing import TYPE_CHECKING, Any
 
 from ..api import ApiError
-from ..main import BaseNamespace, BaseOperation
-from ..utils import json
+from ..tool import BaseNamespace, BaseOperation
+from ..utils import json as jsonutils
+from ..utils import logger
 
 if TYPE_CHECKING:
-    from ..main import HHApplicantTool
-
-
-logger = logging.getLogger(__package__)
+    from ..tool import HHApplicantTool
 
 
 class Namespace(BaseNamespace):
-    method: str
-    endpoint: str
-    params: list[str]
-    data: Any
+    arguments: list[str]
 
 
 class Operation(BaseOperation):
@@ -30,50 +24,86 @@ class Operation(BaseOperation):
     __aliases__ = ("api",)
 
     def setup_parser(self, parser: argparse.ArgumentParser) -> None:
-        parser.add_argument("endpoint", help="Путь до эндпоинта API")
         parser.add_argument(
-            "param",
-            nargs="*",
-            help="Параметры указываются в виде PARAM=VALUE",
-            default=[],
+            "arg",
+            nargs="+",
+            help=(
+                "Метод, путь до эндпоинта API и параметры."
+                " Метод можно опустить, тогда будет использоваться GET."
+                " Параметры можно передать в виде ключ='значение', при чем значения не нужно кодировать,"
+                " либо в виде объекта JSON аргументом сразу после пути."
+            ),
         )
         parser.add_argument(
-            "-m", "--method", "--meth", "-X", default="GET", help="HTTP Метод"
+            "--json",
+            "-j",
+            default=False,
+            help="Принудительно отправить запрос телом в JSON и content-type application/json",
+            action="store_true",
         )
-        # Добавляем аргумент для JSON тела
-        parser.add_argument("-d", "--data", help="JSON строка тела запроса")
 
-    def run(self, tool: HHApplicantTool, args: Namespace) -> None:
+    def _build_payload(
+        self, params: list[str]
+    ) -> tuple[dict[str, Any] | None, bool]:
+        if not params:
+            return None, False
+
+        as_json = False
+        payload = None
+
+        if params[0].lstrip().startswith("{") and params[0].rstrip().endswith(
+            "}"
+        ):
+            if len(params) > 1:
+                raise ValueError(
+                    "JSON должен быть единственным аргументом после endpoint!"
+                )
+            as_json = True
+            payload = json.loads(params[0])
+        elif self._args.json:
+            as_json = True
+            payload = {}
+            for param in params:
+                name, _, value = param.partition("=")
+                try:
+                    value = json.loads(value)
+                except json.JSONDecodeError:
+                    pass
+                payload[name] = value
+        else:
+            payload = {}
+            for param in params:
+                # API принимает параметры с одинаковым именем
+                # Так сделано для фильтров вместо передачи
+                # чего-то чз запятую
+                key, _, value = param.partition("=")
+                payload.setdefault(key, []).append(value)
+
+        return payload, as_json
+
+    def run(self, tool: HHApplicantTool, args: Namespace) -> int | None:
+        self._args = args
         api_client = tool.api_client
 
-        # Парсим JSON, если он передан
-        as_json = False
-        if args.data:
-            try:
-                params = json.loads(args.data)
-                as_json = True
-            except json.JSONDecodeError as e:
-                logger.error(f"Invalid JSON in --data: {e}")
-                return 1
+        methods = {"GET", "POST", "PUT", "PATCH", "DELETE"}
+
+        if args.arg[0].upper() in methods:
+            method, endpoint, *params = args.arg
         else:
-            params = defaultdict(list)
-            for param in args.param:
-                key, value = param.split("=", 1)
-                params[key].append(value)
+            method = "GET"
+            endpoint, *params = args.arg
 
-            # Это лишнее, наверное
-            params = dict(params)
-
+        payload, as_json = self._build_payload(params)
+        logger.debug("%r %s", payload, as_json)
         try:
-            # Передаем json_data как именованный аргумент json
             result = api_client.request(
-                args.method,
-                args.endpoint,
-                params=params,
+                method,
+                endpoint,
+                params=payload,
                 as_json=as_json,
             )
-            print(json.dumps(result))
+            print(jsonutils.dumps(result))
         except ApiError as ex:
             logger.debug(ex)
-            json.dump(ex.data, sys.stderr)
+            jsonutils.dump(ex.data, sys.stderr)
             return 1

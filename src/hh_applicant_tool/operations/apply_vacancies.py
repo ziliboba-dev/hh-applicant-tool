@@ -1,63 +1,194 @@
+# Этот код, блять, уродлив. Просто ужасен
 from __future__ import annotations
 
 import argparse
-import asyncio
+import dataclasses
 import html
-import logging
 import random
 import re
-import time
-from datetime import datetime
 from email.message import EmailMessage
 from itertools import chain
-from pathlib import Path
-from typing import TYPE_CHECKING, Any, Iterator, Literal
-from urllib.parse import urlparse
+from typing import TYPE_CHECKING, Any, Iterator, NoReturn
+from urllib.parse import (
+    urlparse,
+)
 
 import requests
 
 from ..ai.base import AIError
+from ..ai.openai import OpenAIChat
 from ..api import BadResponse, Redirect, datatypes
-from ..api.datatypes import PaginatedItems, SearchVacancy
-from ..api.errors import ApiError, CaptchaRequired, LimitExceeded
-from ..main import BaseNamespace, BaseOperation
-from ..storage.repositories.errors import RepositoryError
+from ..api.datatypes import PaginatedItems, SearchVacancy, Vacancy
+from ..api.errors import ApiError, LimitExceeded
+from ..constants import GITHUB_PROFILE_URL, GITHUB_REPO_URL
+from ..errors import OperationError, XHRError
+from ..tool import BaseNamespace, BaseOperation
+from ..utils import logger
 from ..utils.datatypes import VacancyTestsData
-from ..utils.find import find_key
-from ..utils.json import JSONDecoder
 from ..utils.string import (
     bool2str,
+    choose_similar,
     rand_text,
+    render_template,
     shorten,
     strip_tags,
-    unescape_string,
 )
 
 if TYPE_CHECKING:
-    from ..main import HHApplicantTool
+    from ..tool import HHApplicantTool
 
 
-logger = logging.getLogger(__package__)
+# Классы, имена которых начинаются с _, не импортируются при `import *`
+@dataclasses.dataclass
+class _ApplyState:
+    """Изменяемое состояние рассылки для одного резюме."""
+
+    applied_count: int = 0
+    limit_reached: bool = False
+    do_apply: bool = True
+    site_emails: dict = dataclasses.field(default_factory=dict)
+
+
+class _ApplyError(Exception):
+    """Отклик на вакансию не отправлен. Вакансия пропускается."""
+
+
+# Параметры поиска вакансий, задаваемые флагами
+SEARCH_PARAM_NAMES = (
+    "text",
+    "search_field",
+    "order_by",
+    "per_page",
+    "experience",
+    "schedule",
+    "work_format",
+    "employment",
+    "area",
+    "metro",
+    "professional_role",
+    "industry",
+    "employer_id",
+    "excluded_employer_id",
+    "currency",
+    "salary",
+    "only_with_salary",
+    "label",
+    "period",
+    "date_from",
+    "date_to",
+    "top_lat",
+    "bottom_lat",
+    "left_lng",
+    "right_lng",
+    "sort_point_lat",
+    "sort_point_lng",
+    "no_magic",
+    "premium",
+)
+
+DEFAULT_PER_PAGE = 100
+
+DEFAULT_COVER_LETTER = """\
+{Здравствуйте|Добрый день}, меня зовут %(first_name)s.\
+ {Прошу|Предлагаю} рассмотреть {мою кандидатуру|мое резюме «%(resume_title)s»} на вакансию «%(vacancy_name)s».\
+ С уважением, %(first_name)s."""
+
+
+# Системные промпты - простые строки, не шаблоны
+DEFAULT_COVER_LETTER_SYSTEM_PROMPT = """\
+Ты пишешь сопроводительные письма от первого лица на русском языке.
+
+Правила:
+- Выводи ТОЛЬКО текст письма. Без вступлений («Вот письмо», «Конечно»), без комментариев и пояснений после текста.
+- Не используй markdown: никаких звёздочек, решёток, списков, заголовков, кавычек вокруг письма.
+- Не используй плейсхолдеры в квадратных или фигурных скобках. Если данных нет, просто опусти эту деталь.
+- Не придумывай факты, опыт, компании и навыки, которых нет в запросе.
+- Не добавляй тему письма, контакты и подпись, кроме имени в конце.
+- Пиши только по-русски, без английских слов и вставок."""
+
+DEFAULT_AI_FILTER_SYSTEM_PROMPT = (
+    "Ты определяешь, подходит ли вакансия кандидату. "
+    "Отвечай одним словом: «да» или «нет»."
+)
+
+DEFAULT_TEST_SYSTEM_PROMPT = """\
+Ты проходишь тест при отклике на вакансию от имени кандидата. \
+Отвечай на русском языке.
+
+Правила:
+- Выводи ТОЛЬКО ответ, без вступлений, пояснений и комментариев.
+- Не используй markdown и плейсхолдеры в скобках.
+- Если нужно выбрать вариант, ответь только его числовым ID.
+- Если нужен текстовый ответ, пиши кратко, 1-3 предложения, по существу.
+- Не придумывай факты о кандидате, которых нет в вопросе."""
+
+# Пользовательские промпты - шаблоны, подстановка через %(name)s
+DEFAULT_COVER_LETTER_PROMPT = (
+    "Сгенерируй сопроводительное письмо не более 5-7 предложений "
+    "для вакансии «%(vacancy_name)s» и работодателя «%(employer_name)s». "
+    "Меня зовут: %(first_name)s. Мое резюме: «%(resume_title)s». "
+    "Начни сразу с обращения или первого предложения, закончи именем. "
+    "Только текст письма, без markdown и комментариев."
+)
+
+DEFAULT_AI_FILTER_PROMPT = """\
+Название резюме: %(resume_title)s
+Навыки, перечисленные в резюме: %(resume_skills)s
+Опыт работы соискателя: %(resume_total_experience)s
+Зарплата, указанная в резюме: %(resume_salary)s
+Предпочитаемый соискателем формат работы: %(resume_work_format)s
+
+========================================
+
+Вакансия: %(vacancy_name)s
+Навыки, требуемые в вакансии: %(vacancy_skills)s
+Описание вакансии: %(vacancy_description).2000s
+
+Подходит ли эта вакансия кандидату?"""
+
+DEFAULT_TEST_CHOICE_PROMPT = (
+    "Вопрос: %(question)s\n"
+    "Варианты:\n%(reply_options)s\n"
+    "Выбери правильный вариант. Ответь только его ID."
+)
+
+DEFAULT_TEST_TEXT_PROMPT = """\
+Тебя зовут: %(first_name)s
+Ты ищешь работу в качестве: %(resume_title)s
+Твой профиль на github: %(github_profile_url)s
+Ты хочешь зарплату: %(resume_salary)s
+Подходящие форматы работы: %(resume_work_format)s
+
+Ссылку на GitHub отправляй только если тебя об этом просят.
+
+Ответь на вопрос.
+
+Вопрос: %(question)s
+
+Верни только текст."""
+
+DEFAULT_APPLY_MAIL_SUBJECT = "{Отклик|Резюме} на вакансию %(vacancy_name)s"
+DEFAULT_APPLY_MAIL_BODY = "{Здравствуйте|Добрый день}, {прошу рассмотреть|пожалуйста рассмотрите} мое резюме %(resume_url)s на вакансию %(vacancy_name)s."
 
 
 class Namespace(BaseNamespace):
     resume_id: str | None
-    letter_file: Path | None
-    ignore_employers: Path | None
-    force_message: bool
-    use_ai: bool
-    ai_filter: Literal["heavy", "light", "custom"] | None
-    ai_rate_limit: int
-    ai_filter_prompt: str | None
-    system_prompt: str
-    message_prompt: str
-    order_by: str
-    search: str
-    schedule: str
-    work_format: list[str] | None
+    cover_letter: str | None
+    force_cover_letter: bool
+    ai_filter: bool | None
+    ai_filter_system_prompt: str
+    ai_filter_prompt: str
+    cover_letter_system_prompt: str
+    cover_letter_prompt: str
     dry_run: bool
-    # Пошли доп фильтры, которых не было
-    experience: str
+    # Параметры поиска (None - не задано)
+    text: str | None
+    search_field: list[str] | None
+    order_by: str | None
+    per_page: int
+    experience: str | None
+    schedule: str | None
+    work_format: list[str] | None
     employment: list[str] | None
     area: list[str] | None
     metro: list[str] | None
@@ -67,7 +198,7 @@ class Namespace(BaseNamespace):
     excluded_employer_id: list[str] | None
     currency: str | None
     salary: int | None
-    only_with_salary: bool
+    only_with_salary: bool | None
     label: list[str] | None
     period: int | None
     date_from: str | None
@@ -78,9 +209,8 @@ class Namespace(BaseNamespace):
     right_lng: float | None
     sort_point_lat: float | None
     sort_point_lng: float | None
-    no_magic: bool
-    premium: bool
-    per_page: int
+    no_magic: bool | None
+    premium: bool | None
     total_pages: int
     excluded_filter: str | None
     max_responses: int
@@ -91,75 +221,84 @@ class Namespace(BaseNamespace):
 class Operation(BaseOperation):
     """Откликнуться на все подходящие вакансии."""
 
-    __aliases__ = ("apply", "apply-similar")
+    __aliases__ = ("apply",)
+
+    # Инициализируются в run()
+    tool: HHApplicantTool
+    cover_letter: str
+    dry_run: bool
+    excluded_pat: re.Pattern[str] | None
+    force_cover_letter: bool | None
+    max_responses: int | None
+    resume_id: str | None
+    send_email: bool | None
+    skip_tests: bool | None
+    total_pages: int
+
+    # Шаблоны промптов и писем
+    cover_letter_prompt: str
+    ai_filter_prompt: str
+    test_choice_prompt: str
+    test_text_prompt: str
+    apply_mail_subject: str
+    apply_mail_body: str
+
+    # AI
+    ai_filter: bool
+    cover_letter_ai: OpenAIChat | None
+    vacancy_filter_ai: OpenAIChat | None
+    test_ai: OpenAIChat | None
+
+    # Параметры поиска (проставляются через setattr из SEARCH_PARAM_NAMES)
+    text: str | None
+    search_field: list[str] | None
+    order_by: str | None
+    per_page: int
+    experience: str | None
+    schedule: str | None
+    work_format: list[str] | None
+    employment: list[str] | None
+    area: list[str] | None
+    metro: list[str] | None
+    professional_role: list[str] | None
+    industry: list[str] | None
+    employer_id: list[str] | None
+    excluded_employer_id: list[str] | None
+    currency: str | None
+    salary: int | None
+    only_with_salary: bool | None
+    label: list[str] | None
+    period: int | None
+    date_from: str | None
+    date_to: str | None
+    top_lat: float | None
+    bottom_lat: float | None
+    left_lng: float | None
+    right_lng: float | None
+    sort_point_lat: float | None
+    sort_point_lng: float | None
+    no_magic: bool | None
+    premium: bool | None
 
     def setup_parser(self, parser: argparse.ArgumentParser) -> None:
         parser.add_argument("--resume-id", help="Идентефикатор резюме")
         parser.add_argument(
-            "--search",
-            help="Строка поиска для фильтрации вакансий. Если указана, то поиск будет производиться по вакансиям. В остальных случаях отклики будут производиться по списку рекомендованных вакансий.",  # noqa: E501
-            type=str,
-        )
-        parser.add_argument(
-            "-L",
-            "--letter-file",
-            "--letter",
-            help="Путь до файла с текстом сопроводительного письма.",
-            type=Path,
-        )
-        parser.add_argument(
-            "-f",
-            "--force-message",
-            "--force",
-            help="Всегда отправлять сообщение при отклике",
+            "--force-cover-letter",
+            "--force-letter",
+            help="Всегда отправлять сопроводительное письмо при отклике, даже когда оно не требуется",
             action=argparse.BooleanOptionalAction,
-        )
-        parser.add_argument(
-            "--use-ai",
-            "--ai",
-            help="Использовать AI для генерации сообщений",
-            action=argparse.BooleanOptionalAction,
+            default=True,
         )
         parser.add_argument(
             "--ai-filter",
-            help="Использовать AI для фильтрации вакансий. Режимы: heavy - полный анализ вакансии и резюме, light - быстрый анализ по названию и навыкам, custom - свой системный промпт (--ai-filter-prompt)",
-            choices=["heavy", "light", "custom"],
-            default=None,
-        )
-        parser.add_argument(
-            "--ai-rate-limit",
-            help="Лимит запросов к AI в минуту для фильтрации",
-            type=int,
-            default=40,
-        )
-        parser.add_argument(
-            "--ai-filter-prompt",
-            help="Системный промпт для AI-фильтра (используется только в режиме custom)",
-            default=None,
-        )
-        parser.add_argument(
-            "--system-prompt",
-            "--ai-system",
-            help="Системный промпт для AI генерации сопроводительных писем",
-            default="Напиши сопроводительное письмо для отклика на эту вакансию. Не используй placeholder'ы, твой ответ будет отправлен без обработки.",  # noqa: E501
-        )
-        parser.add_argument(
-            "--message-prompt",
-            "--prompt",
-            help="Промпт для генерации сопроводительного письма",
-            default="Сгенерируй сопроводительное письмо не более 5-7 предложений от моего имени для вакансии",  # noqa: E501
+            help="Использовать дополнительную фильтрацию вакансий через AI (вакансии непрошедшие фильтр попадают в черный список)",
+            action=argparse.BooleanOptionalAction,
         )
         parser.add_argument(
             "--total-pages",
             "--pages",
-            help="Количество обрабатываемых страниц поиска",  # noqa: E501
+            help="Количество обрабатываемых страниц поиска. Больше 2000 результатов API не отдает",  # noqa: E501
             default=20,
-            type=int,
-        )
-        parser.add_argument(
-            "--per-page",
-            help="Сколько должно быть результатов на странице",  # noqa: E501
-            default=100,
             type=int,
         )
         parser.add_argument(
@@ -169,13 +308,13 @@ class Operation(BaseOperation):
         )
         parser.add_argument(
             "--skip-tests",
-            help="Пропускать тесты при откликах вместо",
+            help="Пропускать тесты при откликах вместо их решения",
             action=argparse.BooleanOptionalAction,
         )
         parser.add_argument(
             "--excluded-filter",
             type=str,
-            help=r"Исключить вакансии, если название или описание не соответствует шаблону. Например, `--excluded-filter 'junior|стажир|bitrix|дружн\w+ коллектив|полиграф|open\s*space|опенспейс|хакатон|конкурс|тестов\w+ задан'`",
+            help="Исключить вакансии, если название или описание не соответствует шаблону. Например, `--excluded-filter 'junior|стажир|bitrix|дружн\\w+ коллектив|полиграф|open\\s*space|опенспейс|хакатон|конкурс|тестов\\w+ задан'`. Вакансии попапвшие под фильтр попадают в черный список",
         )
         parser.add_argument(
             "--max-responses",
@@ -196,6 +335,19 @@ class Operation(BaseOperation):
         )
 
         api_search_filters.add_argument(
+            "-s",
+            "--search",
+            dest="text",
+            help="Строка поиска для фильтрации вакансий. Если указана, то поиск будет производиться по вакансиям. В остальных случаях отклики будут производиться по списку рекомендованных вакансий.",  # noqa: E501
+            type=str,
+        )
+        api_search_filters.add_argument(
+            "--per-page",
+            help="Сколько должно быть результатов на странице",  # noqa: E501
+            default=DEFAULT_PER_PAGE,
+            type=int,
+        )
+        api_search_filters.add_argument(
             "--order-by",
             help="Сортировка вакансий",
             choices=[
@@ -205,23 +357,27 @@ class Operation(BaseOperation):
                 "relevance",
                 "distance",
             ],
-            # default="relevance",
         )
         api_search_filters.add_argument(
             "--experience",
-            help="Уровень опыта работы (noExperience, between1And3, between3And6, moreThan6)",
-            type=str,
-            default=None,
+            help="Уровень опыта работы",
+            choices=[
+                "noExperience",
+                "between1And3",
+                "between3And6",
+                "moreThan6",
+            ],
         )
         api_search_filters.add_argument(
             "--schedule",
-            help="Тип графика (fullDay, shift, flexible, remote, flyInFlyOut)",
-            type=str,
+            help="Тип графика",
+            choices=["fullDay", "shift", "flexible", "remote", "flyInFlyOut"],
         )
         api_search_filters.add_argument(
             "--work-format",
             nargs="+",
-            help="Формат работы (REMOTE, HYBRID, ON_SITE, FIELD_WORK)",
+            help="Формат работы",
+            choices=["REMOTE", "HYBRID", "ON_SITE", "FIELD_WORK"],
         )
         api_search_filters.add_argument(
             "--employment", nargs="+", help="Тип занятости"
@@ -245,15 +401,15 @@ class Operation(BaseOperation):
             "--excluded-employer-id", nargs="+", help="Исключить работодателей"
         )
         api_search_filters.add_argument(
-            "--currency", help="Код валюты (RUR, USD, EUR)"
+            "--currency", help="Код валюты", choices=["RUR", "USD", "EUR"]
         )
         api_search_filters.add_argument(
             "--salary", type=int, help="Минимальная зарплата"
         )
         api_search_filters.add_argument(
             "--only-with-salary",
-            default=False,
             action=argparse.BooleanOptionalAction,
+            help="Только вакансии с указанной зарплатой",
         )
         api_search_filters.add_argument(
             "--label", nargs="+", help="Метки вакансий (label)"
@@ -296,7 +452,6 @@ class Operation(BaseOperation):
         )
         api_search_filters.add_argument(
             "--premium",
-            default=False,
             action=argparse.BooleanOptionalAction,
             help="Только премиум вакансии",
         )
@@ -306,15 +461,9 @@ class Operation(BaseOperation):
             help="Поля поиска (name, company_name и т.п.)",
         )
 
-    cover_letter: str = "{Здравствуйте|Добрый день}, меня зовут %(first_name)s. {Прошу|Предлагаю} рассмотреть {мою кандидатуру|мое резюме «%(resume_title)s»} на вакансию «%(vacancy_name)s». С уважением, %(first_name)s."
-
     @property
     def api_client(self):
         return self.tool.api_client
-
-    @property
-    def args(self) -> Namespace:
-        return self._args
 
     def run(
         self,
@@ -322,420 +471,130 @@ class Operation(BaseOperation):
         args: Namespace,
     ) -> None:
         self.tool = tool
-        self._args = args
-        self.cover_letter = (
-            args.letter_file.read_text(encoding="utf-8", errors="ignore")
-            if args.letter_file
-            else self.cover_letter
-        )
-        self.area = args.area
-        self.bottom_lat = args.bottom_lat
-        self.currency = args.currency
-        self.date_from = args.date_from
-        self.date_to = args.date_to
+        config = tool.general_config
+        self.cover_letter = config.get("cover_letter", DEFAULT_COVER_LETTER)
+        for name in SEARCH_PARAM_NAMES:
+            setattr(self, name, getattr(args, name))
         self.dry_run = args.dry_run
-        self.employer_id = args.employer_id
-        self.employment = args.employment
-        self.excluded_employer_id = args.excluded_employer_id
-        self.excluded_filter = args.excluded_filter
-        self.experience = args.experience
-        self.force_message = args.force_message
-        self.industry = args.industry
-        self.label = args.label
-        self.left_lng = args.left_lng
+        self.excluded_pat = None
+        if args.excluded_filter:
+            try:
+                self.excluded_pat = re.compile(
+                    args.excluded_filter, re.IGNORECASE
+                )
+            except re.error as ex:
+                raise OperationError(
+                    f"Некорректное регулярное выражение в --excluded-filter: {ex}"
+                ) from ex
+        self.force_cover_letter = args.force_cover_letter
         self.max_responses = args.max_responses
-        self.metro = args.metro
-        self.no_magic = args.no_magic
-        self.only_with_salary = args.only_with_salary
-        self.order_by = args.order_by
-        self.per_page = args.per_page
-        self.period = args.period
-        self.message_prompt = args.message_prompt
-        self.premium = args.premium
-        self.professional_role = args.professional_role
         self.resume_id = args.resume_id
-        self.right_lng = args.right_lng
-        self.salary = args.salary
-        self.schedule = args.schedule
-        self.work_format = args.work_format
-        self.search = args.search
-        self.search_field = args.search_field
-        self.sort_point_lat = args.sort_point_lat
-        self.sort_point_lng = args.sort_point_lng
-        self.top_lat = args.top_lat
+        self.send_email = args.send_email
+        self.skip_tests = args.skip_tests
         self.total_pages = args.total_pages
-        self.cover_letter_ai = (
-            tool.get_cover_letter_ai(args.system_prompt)
-            if args.use_ai
-            else None
+
+        # Приоритет: аргумент командной строки -> конфиг -> дефолтная константа
+        # Системные промпты - обычный текст, пользовательские - шаблоны
+        self.cover_letter_prompt = config.get(
+            "cover_letter_prompt", DEFAULT_COVER_LETTER_PROMPT
         )
-        self.ai_filter = args.ai_filter
-        self.ai_filter_prompt = args.ai_filter_prompt
-        self.vacancy_filter_ai = None
-        self._resume_analysis_cache: dict[tuple[str | None, str], str] = {}
+        self.ai_filter_prompt = config.get(
+            "ai_filter_prompt", DEFAULT_AI_FILTER_PROMPT
+        )
+        self.test_choice_prompt = config.get(
+            "test_choice_prompt", DEFAULT_TEST_CHOICE_PROMPT
+        )
+        self.test_text_prompt = config.get(
+            "test_text_prompt", DEFAULT_TEST_TEXT_PROMPT
+        )
+        self.ai_filter = bool(args.ai_filter)
+
+        # ai_enabled учитывает и --use-ai, и наличие секции [openai] в
+        # конфиге. Клиенты берутся через кеш tool.ai_client_for: значения
+        # из конфига имеют приоритет над дефолтами
+        self.cover_letter_ai = self.vacancy_filter_ai = self.test_ai = None
+        if tool.ai_enabled:
+            self.cover_letter_ai = tool.ai_chat_for(
+                "openai.cover_letter",
+                system_prompt=DEFAULT_COVER_LETTER_SYSTEM_PROMPT,
+                temperature=0.3,
+            )
+            self.test_ai = tool.ai_chat_for(
+                "openai.test_solver",
+                system_prompt=DEFAULT_TEST_SYSTEM_PROMPT,
+                temperature=0.2,
+            )
+            if self.ai_filter:
+                self.vacancy_filter_ai = tool.ai_chat_for(
+                    "openai.vacancy_filter",
+                    system_prompt=DEFAULT_AI_FILTER_SYSTEM_PROMPT,
+                    temperature=0.0,
+                )
+
+        self.apply_mail_subject = config.get(
+            "apply_mail_subject", DEFAULT_APPLY_MAIL_SUBJECT
+        )
+        self.apply_mail_body = config.get(
+            "apply_mail_body", DEFAULT_APPLY_MAIL_BODY
+        )
 
         self._apply_vacancies()
 
-    def _get_full_resume(self, resume_id: str) -> dict:
-        return self.api_client.get(f"/resumes/{resume_id}")
+    # Если AI ответил что-то непонятное, лучше не отбрасывать вакансию
+    @staticmethod
+    def _parse_is_suitable_response(response: str) -> bool:
+        answer = response.strip().lower().strip(" .!\"'«»")
 
-    def _analyze_resume_heavy(self, resume: dict) -> str:
-        resume_id = resume.get("id")
-        cache_key = (resume_id, "heavy")
-        if cache_key in self._resume_analysis_cache:
-            return self._resume_analysis_cache[cache_key]
+        if re.match(r"(нет?|no|false)\b", answer):
+            return False
 
-        if resume_id:
-            try:
-                full_resume = self._get_full_resume(resume_id)
+        return True
 
-                parts = []
-
-                title = full_resume.get("title", "")
-                if title:
-                    parts.append(f"Должность: {title}")
-
-                if "skills" in full_resume:
-                    parts.append("\n---------- О СЕБЕ ----------")
-                    parts.append(full_resume.get("skills", ""))
-
-                if "skill_set" in full_resume and full_resume["skill_set"]:
-                    parts.append("\n---------- НАВЫКИ ----------")
-                    skills_row = ", ".join(full_resume["skill_set"])
-                    parts.append(skills_row)
-
-                if "experience" in full_resume:
-                    parts.append("\n---------- ОПЫТ РАБОТЫ ----------")
-                    for exp in full_resume.get("experience", []):
-                        company = exp.get("company", "Не указано")
-                        position = exp.get("position", "Не указано")
-                        start = exp.get("start", "")
-                        end = exp.get("end") or "по настоящее время"
-
-                        parts.append(f"\n- {company}")
-                        parts.append(f" Должность: {position}")
-                        parts.append(f" Период: {start} - {end}")
-
-                        description = exp.get("description")
-                        if description:
-                            parts.append(" Описание:")
-                            parts.append(f" {description}")
-
-                result = "\n".join(parts)
-                self._resume_analysis_cache[cache_key] = result
-                return result
-
-            except Exception as e:
-                logger.warning(f"Не удалось получить полное резюме: {e}")
-
-        return ""
-
-    def _analyze_resume_light(self, resume: dict) -> str:
-        resume_id = resume.get("id")
-        cache_key = (resume_id, "light")
-        if cache_key in self._resume_analysis_cache:
-            return self._resume_analysis_cache[cache_key]
-
-        parts = []
-
-        full_resume = self._get_full_resume(resume_id)
-
-        title = full_resume.get("title", "")
-        if title:
-            parts.append(f"Должность: {title}")
-
-        if "skill_set" in full_resume and full_resume["skill_set"]:
-            parts.append("Навыки: ")
-            skills_row = ", ".join(full_resume["skill_set"])
-            parts.append(skills_row)
-
-        result = "\n".join(parts)
-        self._resume_analysis_cache[cache_key] = result
-        return result
-
-    def _get_vacancy_key_skills(self, vacancy_id: str | int) -> str:
-        try:
-            full_vacancy = self.api_client.get(f"/vacancies/{vacancy_id}")
-            key_skills_data = full_vacancy.get("key_skills") or []
-            return ", ".join(
-                s["name"] for s in key_skills_data if s.get("name")
-            )
-        except Exception as e:
-            logger.warning(
-                "Не удалось получить key_skills вакансии %s: %s", vacancy_id, e
-            )
-            return ""
-
-    def _build_vacancy_context(
-        self,
-        vacancy: dict,
-        full_vacancy: dict | None = None,
-        include_full: bool = False,
-    ) -> str:
-        parts: list[str] = []
-
-        name = vacancy.get("name")
-        if name:
-            parts.append(f"Вакансия: {name}")
-
-        if full_vacancy:
-            description = full_vacancy.get("description")
-            if description:
-                parts.append(f"Описание: {strip_tags(description)}")
-        else:
-            if vacancy.get("id"):
-                key_skills = self._get_vacancy_key_skills(vacancy["id"])
-                if key_skills:
-                    parts.append(f"Ключевые навыки: {key_skills}")
-
-        return "\n".join(parts)
-
-    def _ask_ai_suitability(
-        self, prompt: str, vacancy_name: str, log_suffix: str = ""
-    ) -> tuple[bool, str]:
-
-        MAX_RETRIES = 3
-
+    def _is_vacancy_suitable(
+        self, vacancy: dict, placeholders: dict[str, str]
+    ) -> bool:
         if not self.vacancy_filter_ai:
-            return True, ""
+            return True
 
-        for attempt in range(MAX_RETRIES):
-            try:
-                response = self.vacancy_filter_ai.complete(prompt).strip()
-
-                if logger.isEnabledFor(logging.DEBUG):
-                    logger.debug(
-                        "AI %s ответ (попытка %d): %s",
-                        log_suffix,
-                        attempt + 1,
-                        response,
-                    )
-
-                result = self._parse_ai_json_response(response)
-                if result is not None:
-                    suitable, reason = result
-                    if suitable:
-                        logger.info(
-                            "Вакансия %s подтверждена AI %s: %s",
-                            vacancy_name,
-                            log_suffix,
-                            reason or "-",
-                        )
-                        return True, reason
-                    logger.info(
-                        "Вакансия %s отклонена AI %s: %s",
-                        vacancy_name,
-                        log_suffix,
-                        reason or "-",
-                    )
-                    return False, reason
-
-                # Если не удалось распарсить JSON, повторяем запрос
-                logger.warning(
-                    "AI %s не дал валидный JSON для вакансии %s (попытка %d/%d)",
-                    log_suffix,
-                    vacancy_name,
-                    attempt + 1,
-                    MAX_RETRIES,
-                )
-                continue
-
-            except AIError as e:
-                # ChatOpenAI уже делает retry для 429, поэтому здесь только логируем
-                logger.error("Ошибка AI %s: %s", log_suffix, e)
-                return True, ""
-
-        logger.warning(
-            "AI %s не дал валидный JSON после %d попыток для вакансии %s",
-            log_suffix,
-            MAX_RETRIES,
-            vacancy_name,
-        )
-        return True, "не удалось распознать ответ AI"
-
-    def _parse_ai_json_response(
-        self, response: str
-    ) -> tuple[bool, str] | None:
-        response = response.strip().lower()
-
-        if response in ("да", "yes", "true"):
-            return True, ""
-        if response in ("нет", "no", "false"):
-            return False, ""
-
-        import re
-
-        from ..utils import json as utils_json
-
-        if response.startswith("```"):
-            response = re.sub(r"^```(?:json)?\s*", "", response)
-            response = re.sub(r"\s*```$", "", response)
-
-        json_match = re.search(
-            r'\{[^{}]*"suitable"\s*:\s*(true|false)[^{}]*\}',
-            response,
-            re.IGNORECASE,
-        )
-        if json_match:
-            try:
-                data = utils_json.loads(json_match.group(0))
-                suitable = data.get("suitable")
-                if suitable is None:
-                    return None
-                return bool(suitable), str(data.get("reason") or "")
-            except Exception:
-                pass
-
-        return None
-
-    # КТО ЭТО ПРОЧИТАЛ ТОТ ПИД@РАС
-    def _is_vacancy_suitable_heavy(
-        self, vacancy: dict, log_suffix: str = "(heavy)"
-    ) -> tuple[bool, str]:
-        full_vacancy = None
-        if vacancy.get("id"):
-            full_vacancy = self.api_client.get(f"/vacancies/{vacancy['id']}")
-
-        vacancy_info = self._build_vacancy_context(
-            vacancy,
-            full_vacancy=full_vacancy,
-            include_full=True,
-        )
-        prompt = f"Вакансия: {vacancy_info}"
-        return self._ask_ai_suitability(
-            prompt, vacancy.get("name", ""), log_suffix
+        full_vacancy: Vacancy = self.api_client.get(
+            f"/vacancies/{vacancy['id']}"
         )
 
-    def _is_vacancy_suitable_light(self, vacancy: dict) -> tuple[bool, str]:
-        vacancy_info = self._build_vacancy_context(vacancy, include_full=False)
-        prompt = f"Вакансия: {vacancy_info}"
-        return self._ask_ai_suitability(
-            prompt, vacancy.get("name", ""), "(light)"
+        key_skills = ", ".join(
+            s["name"]
+            for s in (full_vacancy.get("key_skills") or [])
+            if s.get("name")
         )
 
-    def _build_filter_system_prompt_heavy(self, resume_analysis: str) -> str:
-        return f"""
-Определи, подходит ли вакансия кандидату.
+        prompt = render_template(
+            self.ai_filter_prompt,
+            {
+                **placeholders,
+                "vacancy_description": strip_tags(
+                    full_vacancy.get("description") or ""
+                ),
+                "vacancy_skills": key_skills,
+            },
+            "промпта AI-фильтра",
+        )
+        response = self.vacancy_filter_ai.complete(prompt)
+        logger.debug("AI ответ фильтра: %s", response)
 
-Смотри в первую очередь на тип работы (роль), а не на технологии.
-
-Правила:
-
-1. Если работа по сути другая -> suitable = false
-
-2. Если роль совпадает или очень близкая:
-   - есть пересечения по задачам или навыкам -> suitable = true
-   - даже частичное совпадение допустимо
-
-3. Общие технологии сами по себе ничего не значат.
-   Если работа разная, это не делает вакансию подходящей.
-
-4. Если данных мало:
-   - ориентируйся на название роли
-
-Ответ строго JSON, reason — краткая причина (2-3 слова, по-русски):
-{{"suitable": true, "reason": "..."}} или {{"suitable": false, "reason": "..."}}
-
-Кандидат:
-{resume_analysis}
-"""
-
-    def _build_filter_system_prompt_light(self, resume_analysis: str) -> str:
-        return f"""
-Ты делаешь очень грубую проверку: подходит вакансия или нет.
-
-Используй только:
-- название резюме
-- список навыков резюме
-- название вакансии
-- явно указанные ключевые навыки вакансии
-
-Не анализируй описание, обязанности, контекст, домен, уровень, карьерный рост и прочую воду.
-Не додумывай ничего, чего нет в тексте.
-
-Правила:
-- если название вакансии и резюме в одной профессии или близких ролях, и есть хотя бы частичное совпадение по ключевым навыкам -> suitable = true
-- если роли явно разные или совпадений по навыкам почти нет -> suitable = false
-- если данных мало -> ориентируйся только на явные совпадения, без фантазий
-
-Ответ только JSON, reason — краткая причина (2-3 слова, по-русски):
-{{"suitable": true, "reason": "..."}} или {{"suitable": false, "reason": "..."}}
-
-Кандидат:
-{resume_analysis}
-"""
-
-    SEL_CAPTCHA_IMAGE = 'img[data-qa="account-captcha-picture"]'
-    SEL_CAPTCHA_INPUT = 'input[data-qa="account-captcha-input"]'
-
-    # Даже куки не грузятся, исправь
-    async def _solve_captcha_async(self, captcha_url: str) -> bool:
-        from playwright.async_api import async_playwright
-
-        captcha_ai = self.tool.get_captcha_ai()
-
-        async with async_playwright() as pw:
-            browser = await pw.chromium.launch(headless=True)
-            try:
-                context = await browser.new_context()
-                page = await context.new_page()
-
-                await page.goto(captcha_url, timeout=30000)
-
-                captcha_element = await page.wait_for_selector(
-                    self.SEL_CAPTCHA_IMAGE, timeout=10000, state="visible"
-                )
-
-                img_bytes = await captcha_element.screenshot()
-
-                captcha_text = await asyncio.to_thread(
-                    captcha_ai.solve_captcha, img_bytes
-                )
-
-                if not captcha_text:
-                    logger.error("AI не смог распознать капчу")
-                    return False
-
-                logger.info(f"Распознанный текст капчи: {captcha_text}")
-
-                await page.fill(self.SEL_CAPTCHA_INPUT, captcha_text)
-                await page.press(self.SEL_CAPTCHA_INPUT, "Enter")
-
-                await page.wait_for_load_state("networkidle", timeout=15000)
-
-                cookies = await context.cookies()
-                for c in cookies:
-                    self.tool.session.cookies.set(
-                        c["name"],
-                        c["value"],
-                        domain=c.get("domain", ""),
-                        path=c.get("path", "/"),
-                    )
-
-                return True
-            finally:
-                await browser.close()
-
-        return False
+        return self._parse_is_suitable_response(response)
 
     def _apply_vacancies(self) -> None:
         resumes: list[datatypes.Resume] = self.tool.get_resumes()
-        try:
-            self.tool.storage.resumes.save_batch(resumes)
-        except RepositoryError as ex:
-            logger.exception(ex)
-        resumes = (
-            list(filter(lambda x: x["id"] == self.resume_id, resumes))
-            if self.resume_id
-            else resumes
-        )
+
         # Выбираем только опубликованные
-        resumes = list(
-            filter(lambda x: x["status"]["id"] == "published", resumes)
-        )
+        resumes = [x for x in resumes if x["status"]["id"] == "published"]
+
         if not resumes:
-            logger.warning("У вас нет опубликованных резюме")
-            return
+            raise OperationError("У вас нет опубликованных резюме")
+
+        if self.resume_id:
+            resumes = [x for x in resumes if x["id"] == self.resume_id]
+            if not resumes:
+                raise OperationError(f"Резюме {self.resume_id} не найдено")
 
         me: datatypes.User = self.tool.get_me()
         seen_employers = set()
@@ -747,19 +606,13 @@ class Operation(BaseOperation):
                 seen_employers=seen_employers,
             )
             if limit_reached:
-                logger.warning(
+                logger.info(
                     "Лимит откликов hh.ru исчерпан. Пропускаю оставшиеся резюме."
                 )
                 print("⛔ Лимит откликов hh.ru исчерпан. Попробуйте позже.")
                 break
 
-        # Синхронизация откликов
-        # for neg in self.tool.get_negotiations():
-        #     try:
-        #         self.tool.storage.negotiations.save(neg)
-        #     except RepositoryError as e:
-        #         logger.warning(e)
-
+        logger.info("Отклики разосланы!")
         print("📝 Отклики на вакансии разосланы!")
 
     def _apply_resume(
@@ -774,10 +627,59 @@ class Operation(BaseOperation):
             resume["title"],
         )
         print("🚀 Начинаю рассылку откликов для резюме:", resume["title"])
-        applied_count = 0
-        limit_reached = False
 
+        state = _ApplyState()
+        placeholders = self._build_resume_placeholders(resume, user)
+
+        for vacancy in self._get_vacancies(resume_id=resume["id"]):
+            if not state.do_apply or self._max_responses_reached(state):
+                break
+            # Любая ошибка отклика (и вакансии в целом) здесь превращается
+            # в пропуск вакансии, приложение не падает
+            try:
+                self._process_vacancy(
+                    vacancy, resume, placeholders, seen_employers, state
+                )
+            except LimitExceeded:
+                state.do_apply = False
+                state.limit_reached = True
+                break
+            except Redirect:
+                logger.warning(
+                    "Игнорирую перенаправление на форму: %s",
+                    vacancy["alternate_url"],
+                )
+            except (ApiError, XHRError, _ApplyError) as ex:
+                logger.warning(
+                    "Пропускаю вакансию %s: %s", vacancy["alternate_url"], ex
+                )
+            except (
+                BadResponse,
+                AIError,
+                ValueError,
+                requests.RequestException,
+            ) as ex:
+                logger.error(
+                    "Пропускаю вакансию %s: %s", vacancy["alternate_url"], ex
+                )
+
+        logger.info(
+            "Закончили рассылку откликов для резюме: %s (%s). Отправлено: %d",
+            resume["alternate_url"],
+            resume["title"],
+            state.applied_count,
+        )
+        print(
+            f"✅️ Закончили рассылку для резюме: {resume['title']}. "
+            f"Отправлено: {state.applied_count}"
+        )
+        return state.limit_reached
+
+    def _build_resume_placeholders(
+        self, resume: datatypes.Resume, user: datatypes.User
+    ) -> dict:
         placeholders = {
+            # Могут быть перезаписаны значениями из резюме
             "first_name": user.get("first_name") or "",
             "last_name": user.get("last_name") or "",
             "email": user.get("email") or "",
@@ -785,483 +687,338 @@ class Operation(BaseOperation):
             "resume_hash": resume.get("id") or "",
             "resume_title": resume.get("title") or "",
             "resume_url": resume.get("alternate_url") or "",
+            "github_profile_url": self.tool.general_config.get(
+                "github_profile_url", GITHUB_PROFILE_URL
+            ),
+        }
+        placeholders.update(
+            self.tool.get_resume_placeholders(resume.get("id")),
+        )
+        return placeholders
+
+    def _max_responses_reached(self, state: _ApplyState) -> bool:
+        if self.max_responses and state.applied_count >= self.max_responses:
+            logger.info(
+                "Достигнут лимит откликов --max-responses (%d). Останавливаюсь.",
+                self.max_responses,
+            )
+            return True
+        return False
+
+    def _process_vacancy(
+        self,
+        vacancy: dict,
+        resume: datatypes.Resume,
+        placeholders: dict,
+        seen_employers: set[str],
+        state: _ApplyState,
+    ) -> None:
+        employer = vacancy.get("employer", {})
+        message_placeholders = {
+            "vacancy_name": vacancy.get("name", ""),
+            "vacancy_url": vacancy.get("alternate_url") or "",
+            "employer_name": employer.get("name", ""),
+            **placeholders,
         }
 
-        do_apply = True
-        storage = self.tool.storage
-        site_emails = {}
-
-        if self.ai_filter:
-            if self.ai_filter in ("heavy", "custom"):
-                resume_analysis = self._analyze_resume_heavy(resume)
-            elif self.ai_filter == "light":
-                resume_analysis = self._analyze_resume_light(resume)
-            else:
-                raise ValueError(
-                    f"Неизвестный режим AI фильтра: {self.ai_filter}"
-                )
-
-            if self.ai_filter == "custom":
-                if not self.ai_filter_prompt:
-                    raise ValueError(
-                        "Режим 'custom' требует --ai-filter-prompt"
-                    )
-                # Кастомный промпт заменяет только инструкции. Анализ резюме
-                # добавляем блоком "Кандидат" в конец (как во встроенных).
-                system_prompt = (
-                    f"{self.ai_filter_prompt}\n\nКандидат:\n{resume_analysis}\n\n"
-                    "Не пиши объяснения.\n"
-                    'Ответ строго JSON:\n'
-                    '{{"suitable": true}} или {{"suitable": false}}'
-                )
-            elif self.ai_filter == "heavy":
-                system_prompt = self._build_filter_system_prompt_heavy(
-                    resume_analysis
-                )
-            else:
-                system_prompt = self._build_filter_system_prompt_light(
-                    resume_analysis
-                )
-
+        # По факту контакты можно получить только здесь?!
+        if vacancy.get("contacts"):
             logger.debug(
-                "AI системный промпт (%s, custom=%s): %s",
-                self.ai_filter,
-                bool(self.ai_filter_prompt),
-                system_prompt,
+                f"Найдены контакты в вакансии: {vacancy['alternate_url']}"
             )
 
-            self.vacancy_filter_ai = self.tool.get_vacancy_filter_ai(
-                system_prompt
+        if not state.do_apply or self._should_skip_vacancy(vacancy):
+            return
+        if self._is_vacancy_rejected(vacancy, message_placeholders):
+            return
+
+        self._load_employer(employer, seen_employers, state)
+        letter = self._build_cover_letter(vacancy, message_placeholders)
+
+        logger.debug(
+            "Пробуем откликнуться на вакансию: %s", vacancy["alternate_url"]
+        )
+
+        if self.dry_run:
+            logger.info(
+                "[dry-run] Отклик не отправляется: %s", vacancy["alternate_url"]
+            )
+            return
+
+        # Если отклик не отправлен, функции ниже бросают исключение, и до
+        # отправки письма дело не доходит
+        if vacancy.get("has_test"):
+            self._apply_with_test(
+                vacancy, resume, letter, message_placeholders, state
+            )
+        else:
+            self._send_negotiation(vacancy, resume, letter, state)
+
+        if self.send_email:
+            self._send_apply_email(
+                vacancy,
+                employer.get("id"),
+                message_placeholders,
+                state,
             )
 
-            if self.args.ai_rate_limit:
-                self.vacancy_filter_ai.rate_limit = self.args.ai_rate_limit
+    def _should_skip_vacancy(self, vacancy: dict) -> bool:
+        """Пропускаем вакансии, на которые нельзя или не нужно откликаться."""
+        url = vacancy["alternate_url"]
 
-        for vacancy in self._get_vacancies(resume_id=resume["id"]):
-            if (
-                getattr(self, "_cancel_event", None)
-                and self._cancel_event.is_set()
-            ):
-                logger.info("Операция отменена пользователем")
-                break
-            if self.max_responses and applied_count >= self.max_responses:
-                logger.info(
-                    "Достигнут лимит откликов --max-responses (%d). Останавливаюсь.",
-                    self.max_responses,
-                )
-                break
-            try:
-                employer = vacancy.get("employer", {})
+        if relations := vacancy.get("relations", []):
+            if "got_rejection" in relations:
+                logger.debug("Вы получили отказ от %s", url)
+                print("⛔ Пришел отказ от", url)
+            logger.debug("Пропускаем вакансию с откликом: %s", url)
+            return True
 
-                message_placeholders = {
-                    "vacancy_name": vacancy.get("name", ""),
-                    "employer_name": employer.get("name", ""),
-                    **placeholders,
-                }
+        if vacancy.get("archived"):
+            logger.debug("Пропускаем вакансию в архиве: %s", url)
+            return True
 
-                try:
-                    storage.vacancies.save(vacancy)
-                except RepositoryError as ex:
-                    logger.debug(ex)
+        if vacancy.get("has_test") and self.skip_tests:
+            logger.debug("Пропускаю вакансию с тестом %s", url)
+            return True
 
-                # По факту контакты можно получить только здесь?!
-                if vacancy.get("contacts"):
-                    logger.debug(
-                        f"Найдены контакты в вакансии: {vacancy['alternate_url']}"
-                    )
+        if redirect_url := vacancy.get("response_url"):
+            logger.debug(
+                "Пропускаем вакансию %s с перенаправлением: %s",
+                url,
+                redirect_url,
+            )
+            return True
 
-                    try:
-                        # logger.debug(vacancy)
-                        storage.vacancy_contacts.save(vacancy)
-                    except RepositoryError as ex:
-                        logger.exception(ex)
+        return False
 
-                if not do_apply:
-                    continue
+    def _blacklist_vacancy(self, vacancy: dict) -> None:
+        if not self.dry_run:
+            self.api_client.put(f"/vacancies/blacklisted/{vacancy['id']}")
 
-                vacancy_id = vacancy["id"]
-                relations = vacancy.get("relations", [])
+    def _is_vacancy_rejected(
+        self, vacancy: dict, message_placeholders: dict
+    ) -> bool:
+        """Обычные фильтры + AI фильтр. True — вакансия отброшена."""
+        url = vacancy["alternate_url"]
 
-                if relations:
-                    logger.debug(
-                        "Пропускаем вакансию с откликом: %s",
-                        vacancy["alternate_url"],
-                    )
-                    if "got_rejection" in relations:
-                        logger.debug(
-                            "Вы получили отказ от %s",
-                            vacancy["alternate_url"],
-                        )
-                        print("⛔ Пришел отказ от", vacancy["alternate_url"])
-                    continue
+        if self._is_excluded(vacancy):
+            logger.info("Вакансия попала под фильтр: %s", url)
+            self._blacklist_vacancy(vacancy)
+            if not self.dry_run:
+                logger.info("Вакансия добавлена в черный список: %s", url)
+            return True
 
-                if vacancy.get("archived"):
-                    logger.debug(
-                        "Пропускаем вакансию в архиве: %s",
-                        vacancy["alternate_url"],
-                    )
-                    continue
+        if (
+            self.ai_filter
+            and self.vacancy_filter_ai
+            and not self._is_vacancy_suitable(vacancy, message_placeholders)
+        ):
+            logger.info("Вакансия отклонена AI фильтром: %s", url)
+            print("🧠 AI посчитал неподходящей", url)
+            self._blacklist_vacancy(vacancy)
+            return True
 
-                if vacancy.get("has_test") and self.args.skip_tests:
-                    logger.debug(
-                        "Пропускаю вакансию с тестом %s",
-                        vacancy["alternate_url"],
-                    )
-                    continue
+        return False
 
-                if redirect_url := vacancy.get("response_url"):
-                    logger.debug(
-                        "Пропускаем вакансию %s с перенаправлением: %s",
-                        vacancy["alternate_url"],
-                        redirect_url,
-                    )
-                    continue
+    def _load_employer(
+        self, employer: dict, seen_employers: set[str], state: _ApplyState
+    ) -> None:
+        """Перед откликом выгружаем профиль компании."""
+        employer_id = employer.get("id")
+        if not employer_id or employer_id in seen_employers:
+            return
 
-                if self._is_excluded(vacancy):
-                    logger.info(
-                        "Вакансия попала под фильтр: %s",
-                        vacancy["alternate_url"],
-                    )
+        employer_profile: datatypes.Employer = self.api_client.get(
+            f"/employers/{employer_id}"
+        )
 
-                    self._save_skipped_vacancy(
-                        vacancy, "excluded_filter", resume["id"]
-                    )
+        # Какая блядь эту строку стерла?
+        seen_employers.add(employer_id)
 
-                    if not self.dry_run:
-                        self.api_client.put(
-                            f"/vacancies/blacklisted/{vacancy['id']}"
-                        )
-                        logger.info(
-                            "Вакансия добавлена в черный список: %s",
-                            vacancy["alternate_url"],
-                        )
-                    continue
+        self._collect_site_emails(employer_profile, employer_id, state)
 
-                # AI фильтрация вакансий
-                if self.ai_filter and self.vacancy_filter_ai:
-                    if self._is_vacancy_already_skipped(vacancy, resume["id"]):
-                        logger.debug(
-                            "Вакансия уже была отклонена ранее: %s",
-                            vacancy["alternate_url"],
-                        )
-                        print(
-                            "⏩ Вакансия уже отклонена ранее",
-                            vacancy["alternate_url"],
-                        )
-                        continue
+    def _collect_site_emails(
+        self,
+        employer_profile: datatypes.Employer,
+        employer_id: str,
+        state: _ApplyState,
+    ) -> None:
+        """Если есть сайт, то ищем на нем емейлы для отправки письма."""
+        if not self.send_email:
+            return
+        site_url = (employer_profile.get("site_url") or "").strip()
+        if not site_url:
+            return
 
-                    if self.ai_filter in ("heavy", "custom"):
-                        is_suitable, ai_reason = self._is_vacancy_suitable_heavy(
-                            vacancy,
-                            "(custom)" if self.ai_filter == "custom" else "(heavy)",
-                        )
-                    elif self.ai_filter == "light":
-                        is_suitable, ai_reason = (
-                            self._is_vacancy_suitable_light(vacancy)
-                        )
-                    else:
-                        raise ValueError(
-                            f"Неизвестный режим AI фильтра: {self.ai_filter}"
-                        )
+        if "://" not in site_url:
+            site_url = "https://" + site_url
+        logger.debug("visit site: %s", site_url)
 
-                    if not is_suitable:
-                        logger.info(
-                            "Вакансия отклонена AI фильтром (%s): %s — %s",
-                            self.ai_filter,
-                            vacancy["alternate_url"],
-                            ai_reason or "-",
-                        )
-                        print(
-                            f"🧠 AI ({self.ai_filter}) посчитал неподходящей"
-                            f" ({ai_reason or '-'})",
-                            vacancy["alternate_url"],
-                        )
+        # Недоступный сайт работодателя не должен мешать отклику
+        try:
+            site_info = self._parse_site(site_url)
+            logger.debug(site_info)
+            state.site_emails[employer_id] = site_info["emails"]
+        except requests.RequestException as ex:
+            logger.error(ex)
+            return
 
-                        self._save_skipped_vacancy(
-                            vacancy, "ai_rejected", resume["id"]
-                        )
-                        continue
+        if site_info:
+            logger.debug("site info: %r", site_info)
 
-                # Перед откликом выгружаем профиль компании
-                employer_id = employer.get("id")
-                if employer_id and employer_id not in seen_employers:
-                    employer_profile: datatypes.Employer = self.api_client.get(
-                        f"/employers/{employer_id}"
-                    )
+    def _build_cover_letter(
+        self, vacancy: dict, message_placeholders: dict
+    ) -> str:
+        if not (
+            self.force_cover_letter or vacancy.get("response_letter_required")
+        ):
+            return ""
 
-                    try:
-                        storage.employers.save(employer_profile)
-                    except RepositoryError as ex:
-                        logger.exception(ex)
+        if self.cover_letter_ai:
+            prompt = render_template(
+                self.cover_letter_prompt,
+                message_placeholders,
+                "промпта сопроводительного письма",
+            )
+            logger.debug("prompt: %s", prompt)
+            letter = self.cover_letter_ai.complete(prompt)
+        else:
+            letter = render_template(
+                rand_text(self.cover_letter),
+                message_placeholders,
+                "сопроводительного письма",
+            )
 
-                    # Если есть сайт, то ищем на нем емейлы для отправки письма
-                    if self.args.send_email and (
-                        site_url := (
-                            employer_profile.get("site_url") or ""
-                        ).strip()
-                    ):
-                        site_url = (
-                            site_url
-                            if "://" in site_url
-                            else "https://" + site_url
-                        )
-                        logger.debug("visit site: %s", site_url)
+        logger.debug("Сопроводительное письмо: %.255s", letter)
+        return letter
 
-                        try:
-                            site_info = self._parse_site(site_url)
-                            site_emails[employer_id] = site_info["emails"]
-                        except requests.RequestException as ex:
-                            site_info = None
-                            logger.error(ex)
+    def _apply_with_test(
+        self,
+        vacancy: dict,
+        resume: datatypes.Resume,
+        letter: str,
+        message_placeholders: dict,
+        state: _ApplyState,
+    ) -> None:
+        """Отклик на вакансию с тестом. При неудаче бросает исключение."""
+        logger.debug("Решаем тест: %s", vacancy["alternate_url"])
+        solved_tests, response_url = self._solve_vacancy_test(
+            vacancy_id=vacancy["id"],
+            resume_hash=resume["id"],
+            letter=letter,
+            placeholders=message_placeholders,
+        )
+        self._process_tests(solved_tests, response_url, vacancy, state)
 
-                        if site_info:
-                            logger.debug("site info: %r", site_info)
+    def _process_tests(
+        self,
+        solved_tests: dict,
+        vacancy_response_url: str,
+        vacancy: dict,
+        state: _ApplyState,
+    ) -> None:
+        """Отправляем решённый тест (капчу решает xhr_request).
 
-                            # try:
-                            #     subdomains = self._get_subdomains(site_url)
-                            # except requests.RequestException as ex:
-                            #     subdomains = []
-                            #     logger.error(ex)
+        Возвращает управление только если отклик отправлен.
+        """
+        result = self._send_vacancy_test(
+            solved_tests, referer_url=vacancy_response_url
+        )
 
-                            try:
-                                storage.employer_sites.save(
-                                    {
-                                        "site_url": site_url,
-                                        "employer_id": employer_id,
-                                        "subdomains": [],
-                                        **site_info,
-                                    }
-                                )
-                            except RepositoryError as ex:
-                                logger.exception(ex)
+        if str(result.get("success")).lower() == "true":
+            state.applied_count += 1
+            logger.info(
+                "Отправили отклик на вакансию с тестом: %s",
+                vacancy["alternate_url"],
+            )
+            print(
+                "📨 Отправили отклик на вакансию с тестом",
+                vacancy["alternate_url"],
+            )
+            return
 
-                letter = ""
+        self._handle_test_error(result, state)
 
-                if self.force_message or vacancy.get(
-                    "response_letter_required"
-                ):
-                    if self.cover_letter_ai and not self.args.letter_file:
-                        msg = self.message_prompt + "\n\n"
-                        ## добавляем переменные в контекст AI запроса ##
-                        msg += (
-                            "[ВАКАНСИЯ] "
-                            + "Название: "
-                            + message_placeholders["vacancy_name"] + ", "
-                            + "Работодатель: "
-                            + message_placeholders["employer_name"] + "; "
-                        )
-                        msg += (
-                            "[РЕЗЮМЕ] "
-                            + "Название: "
-                            + message_placeholders["resume_title"] + ", "
-                            + "Ссылка на резюме: "
-                            + message_placeholders["resume_url"] + ", "    
-                        )
-                        msg += (
-                            "Имя: "
-                            + message_placeholders["first_name"] + ", "
-                            + "Фамилия: "
-                            + message_placeholders["last_name"] + ", "
-                            + "Телефон: "
-                            + message_placeholders["phone"] + ", "
-                            + "Почта: "
-                            + message_placeholders["email"]
-                        )
-                        ## logger.debug("prompt: %s", msg) ## убираем отладку
-                        letter = self.cover_letter_ai.complete(msg)
-                    else:
-                        letter = (
-                            rand_text(self.cover_letter) % message_placeholders
-                        )
+    def _handle_test_error(self, result: dict, state: _ApplyState) -> NoReturn:
+        if result.get("error") == "negotiations-limit-exceeded":
+            state.do_apply = False
+            state.limit_reached = True
+            raise _ApplyError("Достигнут лимит откликов")
 
-                    logger.debug(letter)
+        raise _ApplyError(
+            f"Ошибка при отклике на вакансию с тестом: {shorten(str(result), 300)}"
+        )
 
-                logger.debug(
-                    "Пробуем откликнуться на вакансию: %s",
-                    vacancy["alternate_url"],
-                )
+    def _send_negotiation(
+        self,
+        vacancy: dict,
+        resume: datatypes.Resume,
+        letter: str,
+        state: _ApplyState,
+    ) -> None:
+        """Обычный отклик.
 
-                test_handled = False
+        Возвращает управление только если отклик отправлен. Redirect (hh
+        перенаправил на форму) и остальные ошибки уходят наверх.
+        """
+        res = self.api_client.post(
+            "/negotiations",
+            {
+                "resume_id": resume["id"],
+                "vacancy_id": vacancy["id"],
+                "message": letter,
+            },
+            delay=random.uniform(1, 3),
+        )
+        if res != {}:
+            raise _ApplyError(f"Неожиданный ответ на отклик: {res!r:.300}")
 
-                if vacancy.get("has_test"):
-                    logger.debug(
-                        "Решаем тест: %s",
-                        vacancy["alternate_url"],
-                    )
-
-                    try:
-                        result = self._solve_vacancy_test(
-                            vacancy_id=vacancy["id"],
-                            resume_hash=resume["id"],
-                            letter=letter,
-                        )
-                        test_handled = True
-                        if self.dry_run:
-                            print(
-                                "🧪 [dry-run] тест решён, отклик не отправлен",
-                                vacancy["alternate_url"],
-                            )
-                        elif result.get("success") == "true":
-                            applied_count += 1
-                            print(
-                                "📨 Отправили отклик на вакансию с тестом",
-                                vacancy["alternate_url"],
-                            )
-                        else:
-                            err = (
-                                result.get("error")
-                                if isinstance(result, dict)
-                                else None
-                            )
-
-                            if err == "negotiations-limit-exceeded":
-                                do_apply = False
-                                limit_reached = True
-                                logger.warning(
-                                    "Достигли лимита на отклики (отправлено в этой сессии: %d)",
-                                    applied_count,
-                                )
-                                break
-                            else:
-                                status = (
-                                    result.get("_http_status")
-                                    if isinstance(result, dict)
-                                    else None
-                                )
-                                logger.error(
-                                    "Произошла ошибка при отклике на вакансию с тестом: %s (HTTP %s), result: %s",
-                                    vacancy["alternate_url"],
-                                    status if status is not None else "?",
-                                    shorten(str(result), 300),
-                                )
-                    except ValueError as ex:
-                        if str(ex) == "tests not found.":
-                            logger.warning(
-                                "Не удалось получить тест (%s), пробую откликнуться как на обычную вакансию: %s",
-                                ex,
-                                vacancy["alternate_url"],
-                            )
-                        else:
-                            logger.error(f"Произошла непредвиденная ошибка: {ex}")
-                            continue
-                    except Exception as ex:
-                        logger.error(f"Произошла непредвиденная ошибка: {ex}")
-                        continue
-
-                if not test_handled:
-                    params = {
-                        "resume_id": resume["id"],
-                        "vacancy_id": vacancy_id,
-                        "message": letter,
-                    }
-                    try:
-                        if not self.dry_run:
-                            res = self.api_client.post(
-                                "/negotiations",
-                                params,
-                                delay=random.uniform(1, 3),
-                            )
-                            assert res == {}
-                            applied_count += 1
-                            print(
-                                "📨 Отправили отклик на вакансию",
-                                vacancy["alternate_url"],
-                            )
-                        else:
-                            print(
-                                "🧪 [dry-run] отклик не отправлен",
-                                vacancy["alternate_url"],
-                            )
-                    except Redirect:
-                        logger.warning(
-                            f"Игнорирую перенаправление на форму: {vacancy['alternate_url']}"  # noqa: E501
-                        )
-                        continue
-                    except CaptchaRequired as ex:
-                        logger.warning(f"Требуется капча: {ex.captcha_url}")
-                        try:
-                            success = asyncio.run(
-                                self._solve_captcha_async(ex.captcha_url)
-                            )
-                            if success:
-                                if not self.dry_run:
-                                    res = self.api_client.post(
-                                        "/negotiations",
-                                        params,
-                                        delay=random.uniform(1, 3),
-                                    )
-                                    assert res == {}
-                                    applied_count += 1
-                                    print(
-                                        "📨 Отправили отклик на вакансию после капчи",
-                                        vacancy["alternate_url"],
-                                    )
-                                else:
-                                    print(
-                                        "🧪 [dry-run] отклик после капчи не отправлен",
-                                        vacancy["alternate_url"],
-                                    )
-                            else:
-                                logger.error("Не удалось решить капчу")
-                                raise
-                        except Exception as e:
-                            logger.error(f"Ошибка при решении капчи: {e}")
-                            raise
-
-                # Отправка письма на email
-                if self.args.send_email:
-                    # fix NoneType has no attribute get
-                    # contacts может быть null
-                    mail_to: str | list[str] | None = (
-                        vacancy.get("contacts") or {}
-                    ).get("email") or site_emails.get(employer_id)
-                    if mail_to:
-                        mail_to = (
-                            ", ".join(mail_to)
-                            if isinstance(mail_to, list)
-                            else mail_to
-                        )
-                        mail_subject = rand_text(
-                            self.tool.config.get("apply_mail_subject")
-                            or "{Отклик|Резюме} на вакансию %(vacancy_name)s"
-                        ) % message_placeholders
-                        mail_body = unescape_string(
-                            rand_text(
-                                self.tool.config.get("apply_mail_body")
-                                or "{Здравствуйте|Добрый день}, {прошу рассмотреть|пожалуйста рассмотрите} мое резюме %(resume_url)s на вакансию %(vacancy_name)s."
-                            )
-                        ) % message_placeholders
-                        try:
-                            self._send_email(mail_to, mail_subject, mail_body)
-                            print(
-                                "📧 Отправлено письмо на email по поводу вакансии",
-                                vacancy["alternate_url"],
-                            )
-                        except Exception as ex:
-                            logger.error(f"Ошибка отправки письма: {ex}")
-            except LimitExceeded:
-                do_apply = False
-                limit_reached = True
-                logger.warning(
-                    "Достигли лимита на отклики (отправлено в этой сессии: %d)",
-                    applied_count,
-                )
-                break
-            except ApiError as ex:
-                logger.warning(ex)
-            except (BadResponse, AIError) as ex:
-                logger.error(ex)
-
+        state.applied_count += 1
         logger.info(
-            "Закончили рассылку откликов для резюме: %s (%s). Отправлено: %d",
-            resume["alternate_url"],
-            resume["title"],
-            applied_count,
+            "Отправили отклик на вакансию без теста: %s",
+            vacancy["alternate_url"],
         )
-        print(
-            f"✅️ Закончили рассылку для резюме: {resume['title']}. Отправлено: {applied_count}"
+        print("📨 Отправили отклик на вакансию", vacancy["alternate_url"])
+
+    def _send_apply_email(
+        self,
+        vacancy: dict,
+        employer_id: str | None,
+        message_placeholders: dict,
+        state: _ApplyState,
+    ) -> None:
+        """Отправка письма на email работодателя."""
+        # contacts может быть null
+        mail_to = (vacancy.get("contacts") or {}).get("email") or (
+            state.site_emails.get(employer_id)
         )
-        return limit_reached
+        if not mail_to:
+            return
+        if isinstance(mail_to, list):
+            mail_to = ", ".join(mail_to)
+
+        mail_subject = render_template(
+            self.apply_mail_subject,
+            message_placeholders,
+            "apply_mail_subject",
+            randomize_text=True,
+        )
+        mail_body = render_template(
+            self.apply_mail_body,
+            message_placeholders,
+            "apply_mail_body",
+            randomize_text=True,
+            escape_html=True,
+        )
+        # Отклик уже отправлен, ошибка SMTP не должна считаться его провалом
+        try:
+            self._send_email(mail_to, mail_subject, mail_body)
+            print(
+                "📧 Отправлено письмо на email по поводу вакансии",
+                vacancy["alternate_url"],
+            )
+        except Exception as ex:
+            logger.error(f"Ошибка отправки письма: {ex}")
 
     def _send_email(self, to: str, subject: str, body: str) -> None:
         cfg = self.tool.config.get("smtp", {})
@@ -1269,31 +1026,36 @@ class Operation(BaseOperation):
         msg["Subject"] = subject
         msg["From"] = cfg.get("from") or cfg.get("user")
         msg["To"] = to
-        msg.set_content(body)
+        msg.set_content(body, subtype="html")
         self.tool.smtp.send_message(msg)
-
-    json_decoder = JSONDecoder()
 
     def _get_vacancy_tests(self, response_url: str) -> VacancyTestsData | None:
         """Парсит тесты"""
-        res = self.tool.get_redirect_config(response_url)
-        return find_key(res, "vacancyTests")
+        res = self.tool.get_initial_state(response_url)
+        return res.get("vacancyTests")
 
     def _solve_vacancy_test(
         self,
         vacancy_id: str | int,
         resume_hash: str,
         letter: str = "",
-    ) -> dict[str, Any]:
-        """Загружает тест, ждет паузу и отправляет отклик."""
-        response_url = f"https://hh.ru/applicant/vacancy_response?vacancyId={vacancy_id}&startedWithQuestion=false&hhtmFrom=vacancy"
+        placeholders: dict[str, str] | None = None,
+    ) -> tuple[dict, str]:
+        """Загружает тест и решает его.
+
+        Возвращает payload для отправки и URL страницы отклика (referer).
+        """
+        placeholders = placeholders or {}
+        response_url = f"{self.tool.hh_base_url}/applicant/vacancy_response?vacancyId={vacancy_id}&startedWithQuestion=false&hhtmFrom=vacancy"
 
         if not (tests_data := self._get_vacancy_tests(response_url)):
             raise ValueError(f"Данные тестов не найдены на {response_url}.")
 
         if not (test_data := tests_data.get(str(vacancy_id))):
-            raise ValueError(f"Пустые данные теста вакансии vacancy_id={vacancy_id}")
-        
+            raise ValueError(
+                f"Пустые данные теста вакансии vacancy_id={vacancy_id}"
+            )
+
         logger.debug(f"{test_data = }")
 
         payload: dict[str, Any] = {
@@ -1319,52 +1081,42 @@ class Operation(BaseOperation):
             question = (task.get("description") or "").strip()
 
             if solutions:
-                if self.cover_letter_ai:
+                if self.test_ai:
                     options = "\n".join(
-                        [
-                            f"{s['id']}: {strip_tags(s['text'])}"
-                            for s in solutions
-                        ]
+                        f"{s['id']}: {strip_tags(s['text'])}" for s in solutions
                     )
-                    prompt = (
-                        f"Вопрос: {question}\n"
-                        f"Варианты:\n{options}\n"
-                        f"Выбери ID правильного ответа. Пришли только ID."
+                    prompt = render_template(
+                        self.test_choice_prompt,
+                        {
+                            **placeholders,
+                            "question": question,
+                            "reply_options": options,
+                        },
+                        "промпта выбора ответа в тесте",
                     )
-                    ai_answer = self.cover_letter_ai.complete(prompt).strip()
-                    # Ищем ID в ответе AI на случай лишнего текста
-                    match = re.search(r"\d+", ai_answer)
-                    selected_id = (
-                        match.group(0) if match else solutions[0]["id"]
-                    )
-                    payload[field_name] = selected_id
-                    selected_text = next(
-                        (
-                            strip_tags(s["text"])
-                            for s in solutions
-                            if str(s["id"]) == str(selected_id)
-                        ),
-                        ai_answer,
-                    )
-                    logger.info(
-                        "Тест %s — вопрос: %r → AI выбрал: %r",
-                        vacancy_id,
-                        question,
-                        selected_text,
+                    answer = self.test_ai.complete(prompt).strip(". ")
+                    logger.debug("AI ответ (выбор): %.255s", answer)
+                    # Берём только ID, который реально есть среди вариантов
+                    # К сожалению нейронка постоянно возвращает мусор
+                    # И поэтому через difflib ищем вариант, который макчимально
+                    # похож на ответ от нейронки
+                    payload[field_name] = choose_similar(
+                        answer, [str(s["id"]) for s in solutions]
                     )
                 else:
-                    yes_solution = next(
-                        filter(lambda x: x["text"].lower() == "да", solutions),
-                        None,
-                    )
+                    texts = [strip_tags(s["text"]) for s in solutions]
+                    best = choose_similar("да", texts)
 
-                    payload[field_name] = (
-                        yes_solution["id"]
-                        if yes_solution
+                    # choose_similar возвращает строку (текст варианта) или None.
+                    # Находим соответствующее решение по индексу.
+                    if best is not None and best in texts:
+                        chosen = solutions[texts.index(best)]
+                    else:
                         # По статистике правильный ответ в большинстве случаев
                         # находится посередине
-                        else solutions[len(solutions) // 2]["id"]
-                    )
+                        chosen = solutions[len(solutions) // 2]
+
+                    payload[field_name] = chosen["id"]
             else:
                 # Рандомные эмоджи
                 # payload[f"{field_name}_text"] = "".join(
@@ -1372,18 +1124,18 @@ class Operation(BaseOperation):
                 #     for _ in range(random.randint(3, 15))
                 # )
 
-                if "://" in question:
+                if self.test_ai:
+                    prompt = render_template(
+                        self.test_text_prompt,
+                        {**placeholders, "question": question},
+                        "промпта текстового ответа в тесте",
+                    )
+                    answer = self.test_ai.complete(prompt)
+                    ## добавляем ответ AI на вопрос теста##
+                    logger.debug("AI ответ: %.255s", answer)
+                elif "://" in question:
                     answer = rand_text(
                         "{{Простите|Извините}, но я не перехожу по {внешним|сторонним} ссылкам, так как {опасаюсь взлома|не хочу {быть взломанным|подхватить вирус|чтобы у меня {со|с банковского} счета украли деньги}}.|У меня нет времени на заполнение анкет и гуглодоков}"
-                    )
-                elif self.cover_letter_ai:
-                    prompt = f"Дай краткий и профессиональный ответ на вопрос: {question}"
-                    answer = self.cover_letter_ai.complete(prompt)
-                    logger.info(
-                        "Тест %s — вопрос: %r → AI ответил: %r",
-                        vacancy_id,
-                        question,
-                        answer,
                     )
                 # Тупоеблые любят вопросы с ответами да/нет, где ответ да является правильным в большинстве случаев.
                 else:
@@ -1392,55 +1144,31 @@ class Operation(BaseOperation):
                 payload[f"{field_name}_text"] = answer
 
         logger.debug(f"{payload = }")
+        return payload, response_url
 
-        if self.dry_run:
-            return {"success": "dry_run"}
-
-        # Ожидание перед отправкой (float)
-        time.sleep(random.uniform(2.0, 3.0))
-
-        response = self.tool.session.post(
-            "https://hh.ru/applicant/vacancy_response/popup",
+    def _send_vacancy_test(
+        self,
+        payload: dict,
+        referer_url: str,
+    ) -> dict:
+        """Отправляет решённый тест и возвращает JSON-ответ hh."""
+        return self.tool.xhr_request(
+            "POST",
+            "/applicant/vacancy_response/popup",
             data=payload,
-            headers={
-                "Referer": response_url,
-                # x-gib-fgsscgib-w-hh и x-gib-gsscgib-w-hh вроде в куках
-                # передаются и не нужны
+            referer_url=referer_url,
+            additional_headers={
                 "X-Hhtmfrom": "vacancy",
                 "X-Hhtmsource": "vacancy_response",
-                "X-Requested-With": "XMLHttpRequest",
-                "X-Xsrftoken": self.tool.xsrf_token,
             },
-        )
-
-        logger.debug(
-            "%s %s %d",
-            response.request.method,
-            response.url,
-            response.status_code,
-        )
-
-        try:
-            data = response.json()
-        except (ValueError, requests.exceptions.JSONDecodeError) as ex:
-            logger.warning(
-                "Ответ на отклик с тестом не является JSON (status=%s, %s), result: %s",
-                response.status_code,
-                response.url,
-                shorten(response.text, 300),
-            )
-            raise ValueError(
-                "Эндпоинт отклика на тест вернул не-JSON ответ "
-                "(возможно, перенаправление на капчу или форму)."
-            ) from ex
-
-        if isinstance(data, dict):
-            data["_http_status"] = response.status_code
-
-        return data
+        )  # ty: ignore[invalid-return-type]
 
     def _parse_site(self, url: str) -> dict[str, Any]:
-        with self.tool.session.get(url, timeout=10) as r:
+        with self.tool.session.get(
+            url,
+            timeout=(10, 30),
+            headers={"Referer": GITHUB_REPO_URL},
+        ) as r:
             val = lambda m: html.unescape(m.group(1)) if m else ""
 
             title = val(re.search(r"<title>(.*?)</title>", r.text, re.I | re.S))
@@ -1499,13 +1227,11 @@ class Operation(BaseOperation):
 
     def _get_search_params(self, page: int) -> dict:
         params = {
-            "page": page,
+            **({"page": page} if page else {}),
             "per_page": self.per_page,
         }
         if self.order_by:
             params |= {"order_by": self.order_by}
-        if self.search:
-            params["text"] = self.search
         if self.schedule:
             params["schedule"] = self.schedule
         if self.work_format:
@@ -1566,23 +1292,24 @@ class Operation(BaseOperation):
         return params
 
     def _get_vacancies(
-        self, resume_id: str | None = None
+        self,
+        resume_id: str,
     ) -> Iterator[SearchVacancy]:
         for page in range(self.total_pages):
             logger.debug(f"Загружаем вакансии со страницы: {page + 1}")
             params = self._get_search_params(page)
 
-            if self.search:
-                res: PaginatedItems[SearchVacancy] = self.api_client.get(
-                    "/vacancies",
-                    params,
-                )
-            else:
-                res: PaginatedItems[SearchVacancy] = self.api_client.get(
-                    f"/resumes/{resume_id}/similar_vacancies",
-                    params,
-                )
+            logger.debug(params)
 
+            if self.text:
+                search_endpoint = "/vacancies"
+                params |= {"text": self.text}
+            else:
+                search_endpoint = f"/resumes/{resume_id}/similar_vacancies"
+            res: PaginatedItems[SearchVacancy] = self.api_client.get(
+                search_endpoint,
+                params,
+            )
             logger.debug(f"Количество вакансий: {res['found']}")
 
             if not res["items"]:
@@ -1594,7 +1321,7 @@ class Operation(BaseOperation):
                 return
 
     def _is_excluded(self, vacancy: SearchVacancy) -> bool:
-        if not self.excluded_filter:
+        if not self.excluded_pat:
             return False
 
         snippet = vacancy.get("snippet", {})
@@ -1609,77 +1336,14 @@ class Operation(BaseOperation):
             )
         )
 
-        logger.debug(
-            "Проверяем вакансию на excluded_filter: %s",
-            vacancy.get("alternate_url", vacancy.get("id")),
-        )
+        logger.debug("vacancy summary: %s", vacancy_summary)
 
-        excluded_pat: re.Pattern = re.compile(
-            self.excluded_filter, re.IGNORECASE
-        )
-
-        if excluded_pat.search(vacancy_summary):
+        if self.excluded_pat.search(vacancy_summary):
             return True
 
-        # Грузим полный текст вакансии только, если предыдущий фильтр не сработал
-        r = self.tool.session.get("https://hh.ru/vacancy/" + vacancy["id"])
-        r.raise_for_status()
-
-        # На странице вакансии поле description иногда встречается в двух
-        # вариантах верстки: `"description": "..."` и `"description":"..."`
-        # (без пробела после двоеточия) — учитываем оба.
-        description_match = re.search(r'"description":\s*(.*)', r.text)
-        if not description_match:
-            logger.warning(
-                "Не удалось найти описание вакансии на странице: %s",
-                vacancy["alternate_url"],
-            )
-            return False
-
-        description, _ = self.json_decoder.raw_decode(description_match.group(1))
-        description = strip_tags(description)
-        return bool(excluded_pat.search(description))
-
-    def _is_vacancy_already_skipped(
-        self, vacancy: SearchVacancy, resume_id: str | None = None
-    ) -> bool:
-        try:
-            vacancy_id = vacancy["id"]
-
-            if resume_id:
-                if any(
-                    self.tool.storage.skipped_vacancies.find(
-                        resume_id=resume_id,
-                        vacancy_id=vacancy_id,
-                    )
-                ):
-                    return True
-
-            return any(
-                self.tool.storage.skipped_vacancies.find(
-                    resume_id="",
-                    vacancy_id=vacancy_id,
-                )
-            )
-
-        except Exception:
-            return False
-
-    def _save_skipped_vacancy(
-        self, vacancy: SearchVacancy, reason: str, resume_id: str | None = None
-    ) -> None:
-        try:
-            employer = vacancy.get("employer", {})
-            self.tool.storage.skipped_vacancies.save(
-                {
-                    "resume_id": resume_id or "",
-                    "vacancy_id": vacancy["id"],
-                    "reason": reason,
-                    "alternate_url": vacancy.get("alternate_url"),
-                    "name": vacancy.get("name"),
-                    "employer_name": employer.get("name"),
-                    "created_at": datetime.now(),
-                }
-            )
-        except Exception as ex:
-            logger.warning(f"Не удалось сохранить пропущенную вакансию: {ex}")
+        # Когда мы грузим страницу через API, то можем перехватить капчу, а на
+        # самом сайте нет
+        res = self.api_client.get(f"/vacancies/{vacancy['id']}")
+        description = res["description"]
+        logger.debug("vacancy description: %.255s", description)
+        return bool(self.excluded_pat.search(description))

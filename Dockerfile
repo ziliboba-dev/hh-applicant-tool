@@ -1,52 +1,26 @@
-FROM python:3.13-slim
+FROM python:3.13-alpine
 
-# Системные зависимости
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-      gcc \
-      libc6-dev \
-      procps \
-      cron \
-      dos2unix \
-      tzdata \
-      less && \
-    rm -rf /var/lib/apt/lists/*
+RUN apk add --no-cache tzdata
 
-# Настройка пользователя
 ARG UID=1000
 ARG GID=1000
-RUN groupadd -g $GID docker && \
-    useradd -u $UID -g docker -m -s /bin/bash docker
+RUN addgroup -g $GID docker && \
+    adduser -D -u $UID -G docker -s /bin/sh docker
 
 WORKDIR /app
 
-COPY pyproject.toml poetry.lock* .
-
-# 1. Cтавим playwright, браузер и системные зависимости (этот тяжелый слой теперь закэшируется)
-RUN touch README.md && \
-    pip install --no-cache-dir playwright && \
-    playwright install-deps chromium && \
-    su docker -c "playwright install chromium"
-
-# 2. Теперь копируем исходный код
+COPY pyproject.toml README.md ./
 COPY src ./src
 
-# 3. Устанавливаем саму утилиту и остальные зависимости
-#    Подготовка cron
-RUN pip install --no-cache-dir -e '.[playwright,pillow]' && \
-    touch /var/log/cron.log && chown docker:docker /var/log/cron.log && \
-    mkdir -p ./config && chown -R docker:docker ./config
+RUN apk add --no-cache --virtual .build-deps gcc musl-dev && \
+    pip install --no-cache-dir -e '.' && \
+    apk del .build-deps
 
-# Копируем остальное (эти файлы мешают кешированию последующих слоев)
-COPY --chmod=755 crontab startup.sh .
+ENV CONFIG_DIR=/config
 
-# Запускаем cron и читаем лог
-# cron не видит переменные окружения, переданные главному процессу, точнее
-# он начинает новую сессию, где тот же $CONFIG_DIR пуст
-CMD printenv | grep -E 'CONFIG_DIR|HH_PROFILE_ID' >> /etc/environment && \
-    chown -R docker:docker ./config && \
-    dos2unix -n ./crontab /tmp/crontab && \
-    crontab -u docker /tmp/crontab && \
-    cron && \
-    tail -f /var/log/cron.log
+RUN mkdir -p /config && chown docker:docker /config
+VOLUME /config
 
+USER docker
+
+ENTRYPOINT ["hh-applicant-tool"]

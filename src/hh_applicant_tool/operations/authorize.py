@@ -1,286 +1,320 @@
 from __future__ import annotations
 
 import argparse
-import asyncio
-import logging
-import typing
-from datetime import datetime
-from http.cookiejar import Cookie
-from typing import TYPE_CHECKING
-from urllib.parse import parse_qs, urlsplit
+import base64
+import json
+import random
+import re
+import time
+from typing import TYPE_CHECKING, Any
+from urllib.parse import parse_qs, urljoin, urlsplit
 
-try:
-    from playwright.async_api import async_playwright
-except ImportError:
-    pass
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding
 
-from ..main import BaseOperation
-from ..utils.terminal import print_kitty_image, print_sixel_mage
+from ..errors import OperationError, XHRError
+from ..tool import BaseOperation
+from ..utils import logger
 
 if TYPE_CHECKING:
-    from ..main import HHApplicantTool
+    from ..tool import HHApplicantTool
 
 
-HH_ANDROID_SCHEME = "hhandroid"
+# Заголовки, специфичные для POS
+_LOGIN_HEADERS = {
+    "X-Hhtmfrom": "",
+    "X-Hhtmsource": "account_login",
+}
 
-logger = logging.getLogger(__name__)
+
+class OtpConfirmError(Exception):
+    """Не удалось подтвердить OTP-код. Внутренняя, наружу превращается в OperationError."""
 
 
 class Operation(BaseOperation):
-    """Авторизация через Playwright"""
+    """Авторизация на сайте и через мобильное приложение. Ранее введенный логин и пароль запоминаются и будут использованы, если не указать их."""
 
     __aliases__: list = ["authenticate", "auth", "login"]
 
-    # Селекторы
-    SEL_LOGIN_INPUT = 'input[data-qa="login-input-username"]'
-    SEL_EXPAND_PASSWORD = 'button[data-qa="account-login-submit-by-password"]'
-    SEL_PASSWORD_INPUT = 'input[data-qa="login-input-password"]'
-    SEL_CODE_CONTAINER = 'div[data-qa="account-login-code-input"]'
-    SEL_PIN_CODE_INPUT = 'input[data-qa="magritte-pincode-input-field"]'
-    SEL_CAPTCHA_IMAGE = 'img[data-qa="account-captcha-picture"]'
-    SEL_CAPTCHA_INPUT = 'input[data-qa="account-captcha-input"]'
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._tool: HHApplicantTool | None = None
-        self._args = None
-
-    @property
-    def is_headless(self) -> bool:
-        return not self._args.no_headless and self.is_automated
-
-    @property
-    def is_automated(self) -> bool:
-        return not self._args.manual
-
-    @property
-    def selector_timeout(self) -> int | None:
-        return None if self.is_headless else 5000
+    # Состояние текущей авторизации, заполняется в run()
+    tool: HHApplicantTool
+    username: str
+    password: str | None
+    is_email: bool
+    redirect_url: str
+    xsrf: str
+    pubkey: str
 
     def setup_parser(self, parser: argparse.ArgumentParser) -> None:
         parser.add_argument("username", nargs="?", help="Email или телефон")
-        parser.add_argument("--password", "-p", help="Пароль для входа")
-        parser.add_argument(
-            "--no-headless",
-            "-n",
-            action="store_true",
-            help="Показать окно браузера",
-        )
-        parser.add_argument(
-            "-m", "--manual", action="store_true", help="Ручной режим ввода"
-        )
-        parser.add_argument(
-            "-k",
-            "--use-kitty",
-            "--kitty",
-            action="store_true",
-            help="Вывод капчи в kitty",
-        )
-        parser.add_argument(
-            "-s",
-            "--use-sixel",
-            "--sixel",
-            action="store_true",
-            help="Вывод капчи в sixel",
-        )
+        parser.add_argument("password", nargs="?", help="Пароль")
 
     def run(self, tool: HHApplicantTool, args) -> int | None:
-        self._tool = tool
-        self._args = args
-        try:
-            asyncio.run(self._run())
-        except (KeyboardInterrupt, asyncio.TimeoutError):
-            logger.warning("Операция прервана пользователем или по таймауту")
-            return 1
-        return 0
+        self.tool = tool
+        api_client = tool.api_client
+        session = tool.session
 
-    async def _run(self) -> None:
-        args = self._args
-        api_client = self._tool.api_client
-        storage = self._tool.storage
-
-        if self.is_automated:
-            username = (
-                args.username
-                or storage.settings.get_value("auth.username")
-                or (
-                    await asyncio.to_thread(
-                        input, "Введите email или телефон: "
-                    )
-                )
-            ).strip()
-            if not username:
-                raise RuntimeError("Empty username")
-            logger.debug(f"authenticate with: {username}")
-
-        proxies = api_client.proxies
-        proxy_url = proxies.get("https")
-        chromium_args: list[str] = []
-        if proxy_url:
-            chromium_args.append(f"--proxy-server={proxy_url}")
-            logger.debug(f"Используется прокси: {proxy_url}")
-
-        if self.is_headless:
-            logger.debug("Headless режим активен")
-
-        async with async_playwright() as pw:
-            logger.debug("Запуск браузера...")
-            browser = await pw.chromium.launch(
-                headless=self.is_headless, args=chromium_args
-            )
-
-            try:
-                android_device = pw.devices["Galaxy A55"]
-                context = await browser.new_context(**android_device)
-                page = await context.new_page()
-
-                code_future: asyncio.Future[str | None] = asyncio.Future()
-
-                def handle_request(request):
-                    url = request.url
-                    if url.startswith(f"{HH_ANDROID_SCHEME}://"):
-                        logger.info(f"Перехвачен OAuth redirect: {url}")
-                        if not code_future.done():
-                            sp = urlsplit(url)
-                            code = parse_qs(sp.query).get("code", [None])[0]
-                            code_future.set_result(code)
-
-                page.on("request", handle_request)
-
-                logger.debug(
-                    f"Переход на страницу OAuth: {api_client.oauth_client.authorize_url}"
-                )
-                await page.goto(
-                    api_client.oauth_client.authorize_url,
-                    timeout=60000,
-                    wait_until="load",
-                )
-
-                if self.is_automated:
-                    await page.wait_for_selector(
-                        self.SEL_LOGIN_INPUT, timeout=self.selector_timeout
-                    )
-                    await page.fill(self.SEL_LOGIN_INPUT, username)
-                    logger.debug("Логин введен")
-
-                    password = args.password or storage.settings.get_value(
-                        "auth.password"
-                    )
-                    if password:
-                        await self._direct_login(page, password)
-                    else:
-                        await self._onetime_code_login(page)
-
-                logger.debug("Ожидание OAuth-кода...")
-                auth_code = await asyncio.wait_for(
-                    code_future, timeout=[None, 60.0][self.is_automated]
-                )
-
-                page.remove_listener("request", handle_request)
-
-                logger.debug("Код получен, пробуем получить токен...")
-                token = await asyncio.to_thread(
-                    api_client.oauth_client.authenticate, auth_code
-                )
-                api_client.handle_access_token(token)
-
-                print("Авторизация прошла успешно!")
-
-                if self.is_automated:
-                    storage.settings.set_value("auth.username", username)
-                    if args.password:
-                        storage.settings.set_value(
-                            "auth.password", args.password
-                        )
-
-                storage.settings.set_value("auth.last_login", datetime.now())
-                cookies = await context.cookies()
-                self._set_session_cookies(cookies)
-
-            finally:
-                logger.debug("Закрытие браузера")
-                await browser.close()
-
-    async def _direct_login(self, page, password: str) -> None:
-        logger.info("Вход по паролю...")
-        await page.click(self.SEL_EXPAND_PASSWORD)
-        await self._handle_captcha(page)
-        await page.wait_for_selector(
-            self.SEL_PASSWORD_INPUT, timeout=self.selector_timeout
-        )
-        await page.fill(self.SEL_PASSWORD_INPUT, password)
-        await page.press(self.SEL_PASSWORD_INPUT, "Enter")
-        logger.debug("Форма с паролем отправлена")
-
-    async def _onetime_code_login(self, page) -> None:
-        logger.info("Вход по одноразовому коду...")
-        await page.press(self.SEL_LOGIN_INPUT, "Enter")
-        await self._handle_captcha(page)
-        await page.wait_for_selector(
-            self.SEL_CODE_CONTAINER, timeout=self.selector_timeout
-        )
-
-        print("Код был отправлен. Проверьте почту или SMS.")
-        code = (
-            await asyncio.to_thread(input, "Введите полученный код: ")
+        username = (
+            args.username or input("👤 Введите email или телефон: ")
         ).strip()
-        if not code:
-            raise RuntimeError("Код подтверждения не может быть пустым.")
+        if not username:
+            raise OperationError("Empty username")
+        logger.debug("authenticate with: %s", username)
 
-        await page.fill(self.SEL_PIN_CODE_INPUT, code)
-        await page.press(self.SEL_PIN_CODE_INPUT, "Enter")
-        logger.debug("Форма с кодом отправлена")
+        # Пароль необязателен: если его нет, авторизуемся по одноразовому коду
+        password = args.password
 
-    async def _handle_captcha(self, page):
+        self.is_email = "@" in username
+        if not self.is_email:
+            username = self._normalize_phone_number(username)
+
+        self.tool = tool
+
+        # https://api.hh.ru/openapi/redoc#section/Avtorizaciya/Zapros-avtorizacii-pod-drugim-polzovatelem
+        # Если аккаунт еще и как работодатель может войти, то по умолчанию перекидывает на авторизацию
+        # в качестве employer
+        authorize_url = api_client.oauth_client.authorize_url(
+            force_login="true",
+            role="applicant",
+            force_role="true",
+            skip_choose_account="true",
+        )
+        logger.info(
+            f"Эту ссылку можно открыть в браузере для изучения процесса авторизации: {authorize_url}"
+        )
+        # Переход на страницу нужен для установки cookie xsrf_token
+        r = session.get(authorize_url)
+        self._log_response(r)
+        self.redirect_url = r.url
+        logger.debug(self.redirect_url)
+
+        backurl = parse_qs(urlsplit(self.redirect_url).query)["backurl"][0]
+
+        data = tool.parse_initial_state(r)
+
+        xsrf = data["xsrfToken"]
+
+        # На всякий случай проверим, что значение из cookie совпадает с тем, что на странице
+        assert xsrf == tool.xsrf_token
+
+        self.pubkey = data["loginTrustFlagsSecret"]
+        logger.debug("Публичный ключ для подписи запроса:\n%s", self.pubkey)
+
+        time.sleep(random.uniform(5.0, 10.0))
+
+        # Капчу при входе решает и повторяет запрос сам xhr_request.
+        # Любая другая ошибка запроса прерывает авторизацию.
         try:
-            captcha_element = await page.wait_for_selector(
-                self.SEL_CAPTCHA_IMAGE,
-                timeout=self.selector_timeout,
-                state="visible",
+            # Вход по паролю или запрос OTP-кода
+            self.login(username, password)
+
+            # По паролю мы уже вошли, а для OTP нужно еще ввести полученный код
+            if not password:
+                self._confirm_otp(username)
+        except XHRError as ex:
+            raise OperationError(
+                f"Ошибка запроса при авторизации: {ex}"
+            ) from ex
+        except OtpConfirmError as ex:
+            raise OperationError(str(ex)) from ex
+
+        # Теперь нужно проверить заголовки
+        r = session.get(
+            urljoin(self.redirect_url, backurl),
+            headers={"Referer": self.redirect_url},
+            allow_redirects=False,
+        )
+
+        if r.status_code != 302 or not (location := r.headers.get("location")):
+            raise OperationError(
+                "Ответ не вляется редиректом или не содержит заголовка Location!"
             )
-        except Exception:
-            logger.debug("Капчи нет, продолжаем.")
+
+        sp = urlsplit(location)
+        logger.debug(sp)
+
+        if sp.scheme != "hhandroid" or sp.netloc != "oauthresponse":
+            raise OperationError(
+                f"Неправильный формат URI для получения кода авторизации: {location}"
+            )
+
+        auth_code = parse_qs(sp.query)["code"][0]
+
+        # 5. Обмен кода на токен
+        token = api_client.oauth_client.authenticate(auth_code)
+        api_client.handle_access_token(token)
+        # Куки уже лежат в tool.session — копировать ничего не нужно.
+        print("🎉 Авторизация прошла успешно!")
+
+    def login(self, username: str, password: str | None = None) -> None:
+        """Одна попытка входа.
+
+        С паролем — вход по логину и паролю, без пароля — запрос OTP-кода.
+        Бросает OperationError, если вход невозможен.
+        """
+        if password:
+            self._login_by_password(username, password)
+        else:
+            self._request_otp(username)
+
+    @staticmethod
+    def _log_response(r) -> None:
+        logger.debug(f"{r.request.method} {r.url} {r.status_code}")
+
+    @staticmethod
+    def _check_no_captcha(res: dict[str, Any]) -> None:
+        if (res.get("hhcaptcha") or {}).get("captchaState"):
+            raise OperationError("Сервер вернул капчу в ответе!!!")
+
+    def _login_by_password(self, username: str, password: str) -> None:
+        """Вход по паролю.
+
+        После успеха в tool.session лежат авторизационные cookie, чтобы
+        run() мог пройти редирект на hhandroid://oauthresponse.
+        """
+        # Шлем на тот же URL страницы логина, в failUrl — он же без хоста
+        sp = urlsplit(self.redirect_url)
+        fail_url = f"{sp.path}?{sp.query}"
+
+        params = {
+            "accountType": "APPLICANT",
+            "failUrl": fail_url,
+            "remember": "true",
+            # Пароль был предложен менеджером паролей
+            # А юзернейм типа из LocalStorage
+            "loginTrustFlags": self._login_trust_flags(
+                {"password": {"suggest": True, "paste": False}}
+            ),
+            "username": username,
+            "password": password,
+            # Браузер всегда шлет это поле, при капче его перезапишет xhr_request
+            "captchaText": "",
+        }
+        logger.debug("password login params: %r", {**params, "password": "***"})
+
+        res = self.tool.xhr_request(
+            "POST",
+            self.redirect_url,
+            data=params,
+            referer_url=self.redirect_url,
+            additional_headers=_LOGIN_HEADERS,
+        )
+
+        logger.debug("response keys: %s", list(res))
+
+        if login_error := res.get("loginError"):
+            code = login_error.get("code", "unknown")
+            raise OperationError(f"Ошибка авторизации: {code}")
+
+        self._check_no_captcha(res)
+        # TODO: следующие запросы
+
+    def _request_otp(self, username: str) -> None:
+        """Запрос OTP-кода (SMS/Email)."""
+        params = {
+            "login": username,
+            "otpType": ["phone", "email"][self.is_email],
+            "operationType": "applicant_otp_auth",
+            "authScenario": "APPLICANT_AUTH",
+            "formatPhone": "true",
+            "isSignupPage": "false",
+            # Данные подставлены менеджером паролей
+            "loginTrustFlags": self._login_trust_flags(
+                {"emailOrPhone": {"paste": False, "suggest": True}}
+            ),
+            # Браузер всегда шлет это поле, при капче его перезапишет xhr_request
+            "captchaText": "",
+        }
+
+        logger.debug("otp generate params: %r", params)
+        res = self.tool.xhr_request(
+            "POST",
+            urljoin(self.redirect_url, "/account/otp_generate"),
+            data=params,
+            referer_url=self.redirect_url,
+            additional_headers=_LOGIN_HEADERS,
+        )
+        logger.debug(res)
+
+        if res.get("success"):
+            logger.info("Код авторизации был выслан!")
             return
 
-        args = self._args
-        if not (args.use_kitty or args.use_sixel):
-            raise RuntimeError(
-                "Требуется ввод капчи! Используйте --kitty или --sixel."
-            )
+        self._check_no_captcha(res)
+        raise OperationError("Неправильный запрос!")
 
-        img_bytes = await captcha_element.screenshot()
-        print("\n[!] Требуется ввод капчи.")
-        if args.use_kitty:
-            print_kitty_image(img_bytes)
-        elif args.use_sixel:
-            print_sixel_mage(img_bytes)
-
-        captcha_text = (
-            await asyncio.to_thread(input, "Введите текст с картинки: ")
+    def _confirm_otp(self, username) -> None:
+        """Ввод кода из SMS/Email и подтверждение входа."""
+        code_from = ["SMS", "Email"][self.is_email]
+        code_icon = ["📱", "📧"][self.is_email]
+        code = input(
+            f"{code_icon} Введите полученный код из {code_from}: "
         ).strip()
-        await page.fill(self.SEL_CAPTCHA_INPUT, captcha_text)
-        await page.press(self.SEL_CAPTCHA_INPUT, "Enter")
-        logger.debug("Капча отправлена")
 
-    def _set_session_cookies(self, cookies: list[dict[str, typing.Any]]):
-        for c in cookies:
-            cookie = Cookie(
-                version=0,
-                name=c["name"],
-                value=c["value"],
-                port=None,
-                port_specified=False,
-                domain=c["domain"],
-                domain_specified=True,
-                domain_initial_dot=c["domain"].startswith("."),
-                path=c["path"],
-                path_specified=True,
-                secure=c["secure"],
-                expires=int(c.get("expires") or 0),
-                discard=False,
-                comment=None,
-                comment_url=None,
-                rest={"HttpOnly": str(c.get("httpOnly", False))},
-                rfc2109=False,
-            )
-            self._tool.session.cookies.set_cookie(cookie)
+        if not code:
+            raise OtpConfirmError("Код подтверждения не может быть пустым.")
+
+        params = {
+            "username": username,
+            "code": code,
+            "backurl": self.redirect_url,
+            "operationType": "applicant_otp_auth",
+            "isApplicantSignup": "false",
+            "remember": "true",
+            # Не знаю от чего их вычислять и нужны ли они тут
+            "loginTrustFlags": self._login_trust_flags(),
+            "authScenario": "APPLICANT_AUTH",
+        }
+
+        res = self.tool.xhr_request(
+            "POST",
+            urljoin(self.redirect_url, "/account/login/by_code"),
+            data=params,
+            referer_url=self.redirect_url,
+            additional_headers=_LOGIN_HEADERS,
+        )
+
+        logger.debug(
+            "by_code response: keys=%s success=%s error=%s",
+            list(res),
+            res.get("success"),
+            res.get("error"),
+        )
+
+        if not res.get("success"):
+            error_key = res.get("error", {}).get("key", "UNKNOWN_ERROR")
+            raise OtpConfirmError(f"Ошибка авторизации: {error_key}")
+
+        if not res.get("verification", {}).get("success"):
+            raise OtpConfirmError("Верификация не пройдена!")
+
+    @staticmethod
+    def _normalize_phone_number(phone: str) -> str:
+        # Удаляем всякий мусор типа (, ) и -
+        phone = re.sub(r"\D", "", phone)
+        if len(phone) == 11 and phone[0] == "8":
+            phone = "7" + phone[1:]
+        return phone
+
+    def _login_trust_flags(self, payload: dict[str, Any] | None = None) -> str:
+        payload = {
+            **(payload or {}),
+            # Временная метка при шифровании на фронте устанавливается принудительно
+            "ts": int(time.time() * 1000),
+        }
+        logger.debug(
+            "Данные для кодирования в JSON и шифрования публичным ключом: %r",
+            payload,
+        )
+        # JSON.stringify -> компактный вывод, без пробелов
+        plaintext = json.dumps(payload, separators=(",", ":")).encode()
+        public_key = serialization.load_pem_public_key(self.pubkey.encode())
+        ciphertext = public_key.encrypt(
+            plaintext,
+            padding.OAEP(
+                mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                algorithm=hashes.SHA256(),
+                label=None,
+            ),
+        )
+        return base64.b64encode(ciphertext).decode()

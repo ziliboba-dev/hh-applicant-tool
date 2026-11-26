@@ -73,16 +73,19 @@ dmypy.json
 # Cython debug symbols
 cython_debug/
 
-# Содержимое config кроме .gitkeep игнорируется
-/config/*
-!/config/.gitkeep
-
-Session.vim
-
 # AI assistants / IDE agents
 .claude/
 CLAUDE.md
 .serena/
 .codex/
-uv.lock
+.vscode/
 poetry.lock
+
+# Мой мусор
+# Результаты декомпиляции приложения
+out/
+jadx_out/
+*.har
+models/
+docker-compose.yml
+/Session.vim

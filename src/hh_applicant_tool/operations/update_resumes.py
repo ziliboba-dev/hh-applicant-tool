@@ -2,18 +2,15 @@
 from __future__ import annotations
 
 import argparse
-import logging
 from typing import TYPE_CHECKING
 
 from ..api import ApiError, datatypes
-from ..main import BaseNamespace, BaseOperation
+from ..tool import BaseNamespace, BaseOperation
+from ..utils import logger
 from ..utils.string import shorten
 
 if TYPE_CHECKING:
-    from ..main import HHApplicantTool
-
-
-logger = logging.getLogger(__package__)
+    from ..tool import HHApplicantTool
 
 
 class Namespace(BaseNamespace):
@@ -23,16 +20,13 @@ class Namespace(BaseNamespace):
 class Operation(BaseOperation):
     """Обновить все резюме"""
 
-    __aliases__ = ["update"]
+    __aliases__: list[str] = []
 
     def setup_parser(self, parser: argparse.ArgumentParser) -> None:
         pass
 
     def run(self, tool: HHApplicantTool, args: BaseNamespace) -> None:
         resumes: list[datatypes.Resume] = tool.get_resumes()
-        # Там вызов API меняет поля
-        tool.storage.resumes.save_batch(resumes)
-
         for resume in resumes:
             if not resume.get("can_publish_or_update"):
                 logger.warning(f"Не могу обновить: {resume['alternate_url']}")

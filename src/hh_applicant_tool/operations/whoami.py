@@ -2,17 +2,14 @@
 from __future__ import annotations
 
 import argparse
-import logging
 from typing import TYPE_CHECKING
 
 from ..api import datatypes
-from ..main import BaseNamespace, BaseOperation
+from ..tool import BaseNamespace, BaseOperation
+from ..utils import logger
 
 if TYPE_CHECKING:
-    from ..main import HHApplicantTool
-
-
-logger = logging.getLogger(__package__)
+    from ..tool import HHApplicantTool
 
 
 class Namespace(BaseNamespace):
@@ -36,22 +33,23 @@ class Operation(BaseOperation):
     def run(self, tool: HHApplicantTool, args: BaseNamespace) -> None:
         api_client = tool.api_client
         result: datatypes.User = api_client.get("me")
-        if result.get('auth_type') != 'applicant':
-            logger.warning("Вы вошли не как соискатель! Попробуйте авторизоваться вручную!!!")
-        full_name = " ".join(
-            filter(
-                None,
-                [
-                    result.get("last_name"),
-                    result.get("first_name"),
-                    result.get("middle_name"),
-                ],
+        if result.get("auth_type") != "applicant":
+            logger.warning(
+                "Вы вошли не как соискатель! Попробуйте авторизоваться вручную!!!"
             )
-        ) or 'Анонимный аккаунт'
-        with tool.storage.settings as s:
-            s.set_value("user.full_name", full_name)
-            s.set_value("user.email", result.get("email"))
-            s.set_value("user.phone", result.get("phone"))
+        full_name = (
+            " ".join(
+                filter(
+                    None,
+                    [
+                        result.get("last_name"),
+                        result.get("first_name"),
+                        result.get("middle_name"),
+                    ],
+                )
+            )
+            or "Анонимный аккаунт"
+        )
         counters = result.get("counters", {})
         print(
             f"🆔 {result['id']} {full_name} "
